@@ -1,15 +1,51 @@
 ---
 kind: walkthrough
-last_updated: '2026-07-23T02:20:28+00:00'
-last_writer: hand-off
+last_updated: '2026-07-23T03:00:00+00:00'
+last_writer: take-over
 last_agent: hermes-agent
-session_id: session-2026-07-23-mdimg-review
-last_verified: '2026-07-23T02:18:10+00:00'
+session_id: session-2026-07-23-mdimg-review-2
+last_verified: '2026-07-23T03:00:00+00:00'
 ---
 
 # Walkthrough — llm-wiki
 
-## 2026-07-23 — Markdown image localizer: spec + branch cut
+## 2026-07-23 (afternoon) — Plan v3: respect existing alt/title + review-round-2 fixes
+
+<!-- keep -->
+
+Second design review pass on `plans/markdown-image-localizer.md` (using `design-doc-review` skill's tiered contract). Findings: 3 CRITICAL, 4 WORTH, 5 SMALL, 3 DEFER.
+
+**User raised a new concern** in parallel: v2 spec silently assumed every markdown image needs VLM captioning. That would overwrite accessibility work already done by the doc author. Two-axis model designed in response:
+
+- Axis A: URL kind (`remote-http` / `data-uri` / `local-relative` / `already-localized` / `unsupported`) → drives I/O choice (download / decode / copyFile / no-op)
+- Axis B: author `alt` empty vs non-empty → drives VLM choice (run / skip)
+
+This is now §1 of plan v3 as the "decision matrix" table.
+
+**CRITICAL fixes landed:**
+
+1. **Cache chain break on cold start (v2 bug)** — v2's Step 8a rebind claimed idempotency but only rebound on the cache-hit branch. Cold start left line-1227 `saveIngestCache` binding the old `sourceContent` hash while disk held the new content, so source-watch reenqueue thrashed a full second pipeline. v3 fix: propagate `workingSourceContent` across 5 call sites in `autoIngestImpl` (lines 729, 738, 767, 836, 1227). See plan §8 "Unified propagation".
+2. **Path asymmetry between raw/sources and wiki/sources** — v2 said "one output body, use `toWikiRelPath` if needed". Wrong: `../../wiki/media/` vs `../media/` differ by depth, can't be derived by string replace. v3 fix: `LocalizeResult` returns both `rewrittenSourceMarkdown` and `rewrittenWikiMarkdown`, generated together from the same `SavedImage[]`.
+3. **Name unification** — `sourceIdentity` (ingest.ts local var) vs `sourceFileName` (ingest-cache.ts parameter) vs `sourceSummarySlug` (LocalizeOptions field). v3 fix: `ingest-cache.ts` parameter stays `sourceFileName` (historical name, do not rename); ingest-side var stays `sourceIdentity` at every call site; slug used across §4/§6/§8 is `sourceSummarySlug` uniformly.
+
+**WORTH fixes landed:**
+
+- Already-localized check upgraded from 2-step to 3-step (resolve → regex → exists on absolute path form) to be safe across raw/sources vs wiki/sources relative-path forms.
+- `image_sources:` frontmatter lifecycle: full-rewrite semantics per Step 0.4 run, remote and data-URI only, data URI value truncated to 64 chars + `…`.
+- Quote escape contract split into generator-strict (curly quote, `\]`, no backslash escapes) vs parser-permissive (accepts both quote styles, no unfolding).
+- `extractAndSaveMarkdownImages` explicitly skipped in ingest.ts (~738 and ~836) when localizer is enabled — its work becomes the localizer's `local-relative` classification, with the bonus of VLM captioning empty-alt local images.
+
+**SMALL fixes landed:**
+
+- Timeout 15s → 30s (CJK-network headroom), configurable via new `imageFetchTimeoutMs` field.
+- Content-Length response-header preflight added before body read.
+- Reused `isInsideProject` from `markdown-image-resolver.ts:50` for path-traversal defense (no new `fs-guards.ts`).
+- Test list restructured into 6 groups (A regex+class, B VLM gating, C frontmatter, D caching, E network defense, F concurrency+escape) + integration group. Total 34 test cases up from 21.
+- Risk register grew by 3 entries (rows 10-12) covering author-alt-placeholder edge case, two-form-output miswire, and workingSourceContent audit.
+
+Deliverable: plan.md, context.md, task.md all updated. Zero code touched. Single doc-only commit follows the v2 doc-only pattern (`c696737` was v2's revision commit).
+
+## 2026-07-23 (morning) — Markdown image localizer: spec + branch cut
 
 <!-- keep -->
 

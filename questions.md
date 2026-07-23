@@ -25,9 +25,15 @@ status: in-progress
 
 ## Open
 
-- None.
+### Acceptance override · reviewer_false_positives · 2026-07-23T02:30:00+00:00
 
-- None.
+take-over Step 1.5 review-handoff returned `reject` on two heuristic checks that don't reflect real content:
+
+- `context_description_empty` — reviewer looks for a `## Project Description` header; context.md uses the richer `## Repository facts` / `## Framing invariants` / `## Image pipeline landmarks` structure instead. Content is not empty.
+- `task_list_empty` — reviewer looks for `- [ ]` items; task.md uses `### [ ] Commit N` heading format for its 5-commit plan.
+- 13 `context_path_not_found` WARNs — all target valid `src/lib/*.ts` files that exist; the reviewer's regex forgets to strip trailing `:NNN` line-number suffixes.
+
+User explicitly instructed take-over to force-continue ("准备对新功能的需求和设计进行评审"). Risk logged; no data loss. <!-- resolved -->
 
 - None.
 

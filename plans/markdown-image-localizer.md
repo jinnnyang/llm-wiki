@@ -1,20 +1,21 @@
 # Markdown image localizer
 
-**Status:** Spec (revised 2026-07-23 post-review). Branch: `feat/markdown-image-localizer`, cut from `main` at `e8bdec6` (upstream v0.6.5 tip).
+**Status:** Spec v3 (revised 2026-07-23 after second review round). Branch: `feat/markdown-image-localizer`, cut from `main` at `e8bdec6` (upstream v0.6.5 tip).
 
-**Predecessor:** `plans/multimodal-images.md` — landed the PDF/PPTX/DOCX image-extraction + VLM caption pipeline in v0.6.4. This plan extends the same pipeline to **markdown inputs** with **remote image URLs**.
+**Predecessor:** `plans/multimodal-images.md` — landed the PDF/PPTX/DOCX image-extraction + VLM caption pipeline in v0.6.4. This plan extends the same pipeline to **markdown inputs**.
 
-**Goal:** When a user ingests a `.md` file whose body contains `![alt](url "title")` references pointing at remote images (HTTP/HTTPS or data URI), llm-wiki
+**Goal:** When a user ingests a `.md` file, for every `![alt](url "title")` reference in the body, llm-wiki
 
-1. downloads each remote image,
-2. saves it under `wiki/media/<source-slug>/<slug>-<sha8>.<ext>`,
-3. captions it with the vision model (unless it's below the min-size threshold),
-4. rewrites the **copy in `raw/sources/`** — the app-managed copy, not the user's original input — so both alt/title and URL point at the local file, and records a `image_sources:` mapping in frontmatter for traceability,
-5. writes the same body to the generated wiki page.
+1. **localizes the image bytes** onto disk under `wiki/media/<sourceSummarySlug>/<slug>-<sha8>.<ext>` — download for remote URLs, copyFile for existing local relative paths, base64-decode for data URIs;
+2. **fills in accessibility metadata only when it's missing** — VLM-captions ONLY images whose author-provided `alt` is empty; alt-non-empty images pass through with author metadata preserved;
+3. rewrites the **copy in `raw/sources/`** so `url` points at the local file (and alt/title reflect VLM output when the author omitted them), and records an `image_sources:` mapping in frontmatter for URL traceability;
+4. writes the same body — with the relative-path form adjusted for its target directory — into the generated wiki page under `wiki/sources/`.
 
-The net effect: markdown ingest becomes accessibility-first and link-rot-proof, while VLM cost stays flat via aggressive cross-document caching.
+Net effect: markdown ingest becomes accessibility-first (fills gaps, doesn't overwrite the author's work) and link-rot-proof (all remote URLs materialized to disk). VLM cost stays flat via aggressive cross-document caching AND by respecting authored alt text.
 
-**Key framing (post-review clarification):** `raw/sources/` is an llm-wiki-managed copy of the imported material, not the user's original input. `importSourceFiles` (`source-lifecycle.ts:262`) explicitly `copyFile`s external files into it, and `importSourceUrls` `writeFile`s URL captures into it. This plan treats that copy as a working artifact the app is free to modify — the user's real original file on disk is never touched. Traceability back to the source URL is preserved in a frontmatter mapping, not in the raw markdown body.
+**Key framing (v2 clarification):** `raw/sources/` is an llm-wiki-managed copy of the imported material, not the user's original input. `importSourceFiles` (`source-lifecycle.ts:262`) explicitly `copyFile`s external files into it, and `importSourceUrls` `writeFile`s URL captures into it. This plan treats that copy as a working artifact the app is free to modify — the user's real original file on disk is never touched. Traceability back to the source URL is preserved in a frontmatter mapping, not in the raw markdown body.
+
+**Key framing (v3 clarification):** Accessibility metadata is **user work**. If the user (or the upstream doc author) already wrote `![actual meaningful description](url)`, llm-wiki does not overwrite it — same principle as "we don't rewrite user-authored HTML `<img>`". VLM captioning fills gaps (empty alt), not replaces existing content. This differs from the PDF/DOCX extraction path — those sources have no author-provided alt, so `captionMarkdownImages` (`image-caption-pipeline.ts:283`) can safely overwrite whatever placeholder text mineru emits.
 
 ---
 
@@ -60,26 +61,51 @@ Runtime files:
 
 ## Design
 
-### 1. Single behavior, one toggle
+### 1. Decision matrix: what happens per image reference
 
-**Decision (post-review):** collapse the earlier three-mode design (`never` / `alt-title-only` / `full`) into a **single toggle** — `multimodalConfig.localizeMarkdownImages: boolean` (default `true`).
+**Decision (v3 revision):** the previous "single toggle → all images downloaded + captioned" model is refined into a **decision matrix** with two orthogonal axes. Both axes must be evaluated per-image:
 
-Rationale: `raw/sources/` is a copy the app owns. There is no reason to preserve the original URL in the raw markdown body when frontmatter can carry the same information more cleanly. Two modes is one modes too many when the "preserve original URL in body" mode existed only to protect a file that was never the user's real original in the first place.
+**Axis A: URL kind** — determines whether we perform network I/O.
+- **`remote-http`** — HTTP(S) URL. Fetch bytes over network.
+- **`data-uri`** — inline base64. Decode in-memory.
+- **`local-relative`** — path like `../assets/x.png`. `copyFile` from source-dir-relative resolution; NO network.
+- **`already-localized`** — path matching `wiki/media/<sourceSummarySlug>/<name>-[0-9a-f]{8}.<ext>` AND the file exists on disk. No I/O beyond the existence probe.
+- **`unsupported`** — anything else (ftp://, malformed, etc). Skip; count as failed.
 
-| Toggle | Effect |
-|---|---|
-| `false` | Bypass the localizer entirely. Existing behavior byte-identical to today: remote URLs pass through untouched, no download, no VLM, no rewrite. |
-| `true` **(default)** | For every `![alt](url "title")` in the source: download image → save under `wiki/media/<source-slug>/<slug>-<sha8>.<ext>` → VLM-caption (unless below size threshold) → rewrite the reference in the raw-sources copy to point at the local path with VLM alt/title. Frontmatter `image_sources:` records `local_path: original_url` for every localized image. |
+**Axis B: Author-provided `alt`** — determines whether we run the VLM.
+- **`alt` non-empty** (author or upstream tool wrote something) → **skip VLM**. Preserve author alt verbatim. Preserve author title verbatim if any.
+- **`alt` empty** → run VLM (subject to sub-conditions below). Fill both alt AND title from VLM output. If the author *did* supply a title but left alt empty, the VLM-generated title wins (rationale: an alt-less image whose only accessibility hook is a title is malformed; VLM re-does both consistently).
 
-Wiki summary page (`wiki/sources/<slug>.md`) always receives the localized body — no divergence between the raw-sources copy and the wiki page.
+**Composite behavior:**
 
-### 2. Threshold behavior for small images
+| URL kind × author alt | non-empty alt | empty alt |
+|---|---|---|
+| `remote-http` | Download → SHA/URL cache lookup → write local file → rewrite URL only; preserve alt/title | Download → cache lookup → write local file → VLM (if above size threshold) → rewrite URL + alt + title |
+| `data-uri` | Decode → SHA cache → write local file → rewrite URL only; preserve alt/title | Decode → SHA cache → write local file → VLM (if above size threshold) → rewrite URL + alt + title |
+| `local-relative` | `copyFile` → SHA cache → rewrite URL only (path form adjusted per target dir); preserve alt/title | `copyFile` → SHA cache → VLM (if above threshold) → rewrite URL + alt + title |
+| `already-localized` | No I/O; leave reference untouched | No I/O; skip VLM (alt is deliberately empty, e.g. previous localize round decided it was too small — don't oscillate) |
+| `unsupported` | Untouched, counted as `failed` | Untouched, counted as `failed` |
 
-`multimodalConfig.minImagePixelSize: number` (default `100`, meaning "if either dimension is < 100px, skip the VLM step").
+**Interaction with the master toggle:** `multimodalConfig.localizeMarkdownImages: boolean` (default `true`) is the outermost gate.
+- `false` → the entire Step 0.4 hook is bypassed; byte-identical to pre-v0.6.6 behavior.
+- `true` → the decision matrix above runs per image.
 
-- **Under threshold**: still download + save locally + rewrite links (link-rot protection). **Skip VLM** — alt stays whatever the source had (usually empty for a favicon-sized decorative image).
-- **Over threshold**: full pipeline (download + caption + rewrite).
-- **Unknown dimensions** (SVG, HEIC, or decode failure): treat as over threshold, run VLM. Better to spend a caption than skip a real chart.
+**Rationale for the two-axis model (v3):**
+
+The v2 plan collapsed everything into a single "download + caption + rewrite" pipeline. That silently overwrote any author-authored alt text — a regression against accessibility work the user (or upstream doc author) may have already done. The v3 refinement:
+
+1. **VLM is a gap-filler, not a rewriter.** Authored alt is signal, not noise. `![Screenshot of the invoice detail page showing line-item totals](./invoice.png)` is more useful than any VLM output — because the author knows what the image *means in context*, and the VLM only knows what pixels are visible.
+2. **Local relative paths were previously handled by `extractAndSaveMarkdownImages`** (`extract-source-images.ts:200`). That function `copyFile`s them into `wiki/media/` but does NOT caption them. Under the v2 plan, local paths would remain the responsibility of the old function and never touch the localizer. Under v3, they enter the localizer's decision matrix so that empty-alt local images DO get VLM-captioned — closing an accessibility gap that has existed since v0.6.4. `extractAndSaveMarkdownImages` becomes redundant when the localizer is enabled; §8 documents the coordination.
+3. **The download vs copy vs decode distinction is I/O**, not a policy concern. All three converge on "bytes are on disk under `wiki/media/<slug>/<name>-<sha8>.<ext>`" and after that point the pipeline is uniform.
+
+### 2. Threshold behavior for small images (secondary VLM gate)
+
+`multimodalConfig.minImagePixelSize: number` (default `100`, meaning "if either dimension is < 100px, skip the VLM step even for empty-alt images"). This is a **secondary** VLM gate — it only applies when Axis B (alt empty) says "would VLM". Alt-non-empty images never touch this threshold because they never touch VLM.
+
+- **Empty alt + under threshold** — bytes still land on disk (link-rot protection), URL still rewritten. Alt stays empty. Title stays whatever the author had (usually also empty for a favicon).
+- **Empty alt + over threshold** — full VLM pipeline. Alt + title populated.
+- **Empty alt + unknown dimensions** (SVG, HEIC, or decode failure) — treated as over threshold, run VLM. Better to spend a caption than skip a real chart.
+- **Non-empty alt** — threshold irrelevant; VLM never runs.
 
 **Phase 1 implementation:** dimension probing is done in TypeScript via `createImageBitmap` (available in Tauri webview). Cheap for PNG/JPEG/WebP/GIF, unreliable for SVG (returns bitmap-rasterized bounds — good enough). Phase 2 replaces this with a Rust command that adds the `image` crate's `jpeg,webp,gif` features. **Test note:** vitest runs under jsdom by default and `createImageBitmap` is undefined there — the localizer's probe function must be mockable, and Commit 3's first test verifies the mock path.
 
@@ -135,24 +161,34 @@ url → URL cache hit (within TTL)? ─yes→ read canonical file → done (no H
 
 ### 4. Storage layout (per-source, unchanged)
 
-New files land at `<projectPath>/wiki/media/<source-slug>/<slug>-<sha8>.<ext>`.
+New files land at `<projectPath>/wiki/media/<sourceSummarySlug>/<slug>-<sha8>.<ext>`.
 
-- `<source-slug>` matches the existing `injectImagesIntoSourceSummary` convention — one media dir per source file. This preserves `cascadeDeleteWikiPage`'s orphan-media reaping.
-- `<slug>` is `safeSlug(vlm-alt || vlm-title || url-basename)` — falls back down the chain so we always have a human-friendly name.
+- `<sourceSummarySlug>` matches the existing `injectImagesIntoSourceSummary` convention — one media dir per source file. This preserves `cascadeDeleteWikiPage`'s orphan-media reaping. §6 `LocalizeOptions.sourceSummarySlug` and §8's local `sourceSummarySlug` variable refer to this same value.
+- `<slug>` is `safeSlug(vlm-alt || vlm-title || author-alt || url-basename)` — falls back down the chain so we always have a human-friendly name. Author alt is preferred over url-basename for images the VLM didn't touch.
 - `-<sha8>` is `sha256.slice(0, 8)` — deduplication key and idempotency marker.
 
-Wiki-page image references use the relative form `../media/<source-slug>/<name>-<sha8>.ext` (relative to `wiki/sources/<slug>.md`). The raw-sources copy uses `../../wiki/media/<source-slug>/<name>-<sha8>.ext` (relative to `raw/sources/<slug>.md`). Path resolution helper lives in the new module.
+**Path form is target-directory-dependent.** The same localized file appears in two markdown bodies:
+
+| Target file | Relative form used | Relative to |
+|---|---|---|
+| `raw/sources/<slug>.md` | `../../wiki/media/<sourceSummarySlug>/<name>-<sha8>.<ext>` | `raw/sources/` (two levels up to project root, then down) |
+| `wiki/sources/<slug>.md` | `../media/<sourceSummarySlug>/<name>-<sha8>.<ext>` | `wiki/sources/` (one level up to `wiki/`, then down) |
+
+The localizer produces **both forms** as separate outputs (§6 `LocalizeResult` returns `rewrittenSourceMarkdown` and `rewrittenWikiMarkdown` — see there). Do not compute one from the other by string replacement; the two are generated together from the same `SavedImage[]` list with a `relPath` helper that resolves against each target directory.
 
 ### 5. Idempotency
 
-Every URL we've localized ends up at a path matching `wiki/media/<slug>/<name>-[0-9a-f]{8}.<ext>`. The localizer's URL classifier detects this shape via **two-step check**:
+Every URL/local-path/data-URI we've localized ends up at a path matching the shape `.../wiki/media/<sourceSummarySlug>/<name>-[0-9a-f]{8}.<ext>`. The localizer's URL classifier detects this shape via a **two-step check** performed on the **resolved absolute path**:
 
-1. Regex match on the path shape.
-2. `fileExists(resolvedAbsPath)` — the file must actually be on disk.
+1. **Resolve** the reference to an absolute filesystem path — depends on the reference form:
+   - Relative path (`../../wiki/media/notes/x-abc12345.png` or `../media/notes/x-abc12345.png`) → resolve against the target markdown file's directory (`raw/sources/<slug>.md` for the source pass, `wiki/sources/<slug>.md` for the wiki pass).
+   - Absolute path → use as-is.
+2. **Regex match** on the absolute path's suffix: `/wiki/media/[^/]+/[^/]+-[0-9a-f]{8}\.[a-z0-9]+$`.
+3. **`fileExists(absPath)`** — the file must actually be on disk.
 
-Only when both pass does the classifier return `already-localized` (no re-fetch, no re-caption, no re-write). If the regex matches but the file is missing, fall through to `local-relative` — the existing `extractAndSaveMarkdownImages` path handles the miss cleanly.
+All three must pass for `already-localized`. Otherwise fall through to `local-relative` — the localizer's own `copyFile` path handles it cleanly (importantly, this replaces the previous "fall through to `extractAndSaveMarkdownImages`" pattern; §8 explains why `extractAndSaveMarkdownImages` is no longer called at the same call site).
 
-For remote URLs, URL-cache hits within TTL do the same job.
+For remote URLs, the URL cache within TTL does the equivalent job — a hit bypasses the network entirely.
 
 **Second ingest within TTL:** I/O-free — hits every cache tier. Not literally a full no-op because the ingest activity still records the run and `saveIngestCache` still touches disk, but zero HTTP, zero VLM, zero image writes.
 
@@ -164,7 +200,7 @@ Public API:
 export interface LocalizeOptions {
   projectPath: string
   sourcePath: string             // absolute path of the raw-sources copy
-  sourceSummarySlug: string      // matches ingest.ts convention
+  sourceSummarySlug: string      // matches ingest.ts's local var; drives wiki/media/<slug>/ dir
   markdown: string               // md body (may include frontmatter)
   llmConfig: LlmConfig           // for VLM captioning
   multimodalConfig: MultimodalConfig
@@ -173,18 +209,30 @@ export interface LocalizeOptions {
 }
 
 export interface LocalizeResult {
-  /** Rewritten md for the raw-sources copy. Body has local paths;
-   *  frontmatter carries `image_sources:` mapping for traceability. */
-  rewrittenMarkdown: string
+  /** Rewritten md ready to write to `raw/sources/<slug>.md`. Image refs use
+   *  the `../../wiki/media/<slug>/...` relative form. Frontmatter carries
+   *  the `image_sources:` mapping. */
+  rewrittenSourceMarkdown: string
+  /** Rewritten md ready to seed `wiki/sources/<slug>.md`. Same body, same
+   *  frontmatter, but image refs use the `../media/<slug>/...` relative
+   *  form. Callers who don't need this form (e.g. the raw-sources writer
+   *  in Step 0.4) can ignore it. */
+  rewrittenWikiMarkdown: string
   /** Localized image metadata for `injectImagesIntoSourceSummary`. */
   savedImages: SavedImage[]      // reuse existing type
   stats: {
-    downloaded: number
-    urlCacheHits: number
-    shaCacheHits: number
-    captioned: number
-    captionCacheHits: number
-    skippedTooSmall: number
+    // I/O
+    downloaded: number         // remote URLs fetched over HTTP
+    urlCacheHits: number       // remote URLs served from URL cache
+    copied: number             // local relative paths copyFile'd
+    decoded: number            // data URIs
+    alreadyLocalized: number   // already-localized refs left untouched
+    // VLM
+    captioned: number          // fresh VLM calls
+    captionCacheHits: number   // caption cache hits (SHA-keyed)
+    skippedAuthorAlt: number   // author supplied non-empty alt; VLM skipped
+    skippedTooSmall: number    // empty alt but below minImagePixelSize; VLM skipped
+    // failures
     failed: number
   }
 }
@@ -194,60 +242,73 @@ export async function localizeMarkdownImages(
 ): Promise<LocalizeResult>
 ```
 
-**No separate `rewrittenSourceMarkdown` vs `rewrittenWikiMarkdown` output.** Since raw-sources and wiki-summary receive the same localized body, one output suffices. Callers pick the relative-path form (see §4) via a helper `toWikiRelPath(md, sourceSlug)` if needed.
+**Two body outputs, one call.** `rewrittenSourceMarkdown` and `rewrittenWikiMarkdown` are generated together from the same `SavedImage[]` and per-ref `PathForm` computation; there is no cheap string-replace to convert one into the other (paths differ by depth, not by substring — `../../wiki/media/` and `../media/` share no unique anchor). Each writer picks the field it needs; the raw-sources writer in Step 0.4 picks `rewrittenSourceMarkdown`, the wiki-page seeder (currently the LLM-generation prompt in `ingest.ts:~1000`) picks `rewrittenWikiMarkdown`.
 
 **Concurrency:** internal, not on the public API. The module reads `multimodalConfig.concurrency` and applies:
 - **Download pool:** `min(4, multimodalConfig.concurrency)` — network politeness cap.
 - **Caption pool:** `multimodalConfig.concurrency` — LLM-provider-bounded.
+- **CopyFile pool:** unlimited — local filesystem copies are cheap.
 
 Internals (private):
 
 - `MD_IMAGE_RE_WITH_TITLE` — extended regex (see §7).
 - `findImageReferencesWithTitle(markdown)` — replaces `findImageReferences` locally for this pipeline; original stays as-is for backwards compat.
-- `classifyImageUrl(url, projectPath)` — one of `remote-http` / `data-uri` / `local-relative` / `already-localized` / `unsupported`. `already-localized` requires the two-step check from §5.
+- `classifyImageUrl(url, sourceDir, projectPath)` — one of `remote-http` / `data-uri` / `local-relative` / `already-localized` / `unsupported`. `already-localized` requires the three-step check from §5 (resolve → regex → exists), done against the resolved absolute path.
 - `readUrlCache(pp) / upsertUrlCacheEntry(pp, url, entry)` — per-entry upsert (see §3.2 concurrency note).
 - `sha8OfBytes(bytes)` — 8-char hex prefix of SHA-256.
 - `probeImageDimensions(mimeType, bytes)` — `createImageBitmap`-based, mockable for vitest. Returns `{ width: 0, height: 0 }` for SVG / decode failure (treated as "over threshold").
-- `slugFromCaption(caption, urlPath)` — `safeSlug` chain: caption → url basename → `image`.
-- `rewriteBySlot(markdown, replacements)` — replaces `![alt](url "title")` at each recorded offset, in reverse offset order to keep earlier offsets valid.
-- `mergeImageSourcesFrontmatter(rawBlock, mapping)` — merges the new `image_sources:` YAML entries into the existing frontmatter block (creates one if none exists). Uses `parseFrontmatter` and preserves untouched keys.
+- `slugFromChain(vlmAlt, vlmTitle, authorAlt, url)` — `safeSlug` chain; author alt inserted between VLM output and URL basename.
+- `rewriteBySlot(markdown, replacements, pathForm)` — replaces `![alt](url "title")` at each recorded offset, in reverse offset order to keep earlier offsets valid. `pathForm` selects `sourceRelPath` or `wikiRelPath` per replacement.
+- `mergeImageSourcesFrontmatter(rawBlock, mapping)` — see §11 for lifecycle rules; uses `parseFrontmatter` and preserves untouched keys.
 - `resolveDataUri(dataUri)` — decodes; rejects on decoded size > 20 MB, on non-`image/*` MIME, on malformed base64.
+- `resolveLocalRelative(url, sourceDir)` — resolves `../assets/x.png` against the raw-sources copy's dir, validates the resulting absolute path is inside the project root (path-traversal defense — reuse `isInsideProject` from `src/lib/markdown-image-resolver.ts:50`).
 
-### 7. Regex extension
+### 7. Regex extension and quote-escape contract
 
-Current `MD_IMAGE_RE`:
+Current module-level `MD_IMAGE_RE` (unchanged, still used by the existing caption pipeline):
 
 ```javascript
 /(!\[)([^\]]*)(\]\()([^)\s]+)(\))/g
 ```
 
-Splits url on first whitespace, drops any `"title"`. Extended form used **inside the new module** (does not replace the module-level `MD_IMAGE_RE` — that stays for the existing caption pipeline's backwards compatibility):
+Splits url on first whitespace, drops any `"title"`. The localizer ships an **extended sibling** used only inside the new module (does not replace the module-level regex — that stays for `image-caption-pipeline.ts` backwards compat):
 
 ```javascript
 // Groups: 1=!, 2=alt, 3=](, 4=url (no whitespace, no <>), 5=optional " title" or ' title', 6=)
 const MD_IMAGE_RE_WITH_TITLE = /(!\[)([^\]]*)(\]\()([^)\s]+)(?:\s+(["'])((?:(?!\5).)*)\5)?(\))/g
 ```
 
-Escaping notes:
-- Title value MUST have its quote char un-doubled per CommonMark. Use `"` when generating (safer for CJK).
-- Title text sanitize before writing: `"` → `\u201C`/`\u201D`, newlines → space.
+**Parser side (permissive, per CommonMark 0.30):**
 
-We deliberately don't handle angle-bracket URLs (`![alt](<url>)`) in Phase 1 — mineru rewriter (`mineru.ts:373`) has that logic if we ever need it.
+- Accepts both `"..."` and `'...'` title delimiters.
+- Does **not** perform escape unfolding — CommonMark 0.30 spec §6.7 says titles admit backslash-escapes for the delimiter (`\"` inside a `"..."` title) but our parse target is round-trip preservation, not full-fidelity CommonMark interpretation. The captured group 6 is passed downstream verbatim, and if it contained `\"` it stays `\"`.
+- HTML `<img>` — not matched. Documented non-goal (see top-of-file).
+- Angle-bracket URLs `![alt](<url>)` — not matched in Phase 1. `mineru.ts:373` has that logic if we ever need to support it.
+
+**Generator side (strict, one form only):**
+
+- The localizer only ever writes `![alt](url "title")` — double-quoted title, single line. Single-quoted or angle-bracket variants are never generated.
+- **Alt sanitization**: `]` in author or VLM alt would break the markdown; replace with `\]`. Newlines in alt → single space. Zero-width chars stripped. Verified pre-write.
+- **Title sanitization**: `"` in title would break the delimiter; replace with `\u201C` (opening curly) or `\u201D` (closing curly) heuristically (or just `\u201D` uniformly — the visual distinction is not preserved from source anyway). Newlines → space. Backticks left as-is (harmless inside titles).
+- **No backslash escaping in generated output** — we sanitize away the problem characters rather than emit `\"`/`\]`. This keeps the generated markdown readable and matches how mineru/pandoc write CJK text.
+
+CJK note: user's environment is Chinese; the curly-quote substitution is safer than backslash-escapes because backslashes inside CJK titles are visually unclear and some downstream renderers mishandle them.
 
 ### 8. Integration with `autoIngestImpl` (ingest.ts:637)
 
-Insert a new **Step 0.4** immediately after source content is read (line ~710) and **before** the cache-lookup at line ~729. The localizer runs on **both cache-miss and cache-hit** paths, uniformly, because the mechanism below guarantees stable convergence.
+Insert a new **Step 0.4** immediately after source content is read (line ~710) and **before** the cache-lookup at line ~729. The localizer runs on **both cache-miss and cache-hit paths** — uniform placement is what makes the cache mechanics below sound.
+
+**Naming convention (v3):** in `autoIngestImpl` scope, the ingest-cache functions are called with `sourceIdentity` as the second argument. That variable is produced by `sourceIdentityForPath(pp, sp)` at line 649 and is *not* renamed in this plan. The `ingest-cache.ts` implementation calls the same parameter `sourceFileName` (see `ingest-cache.ts:63/100/120`) — that's the historical name of the parameter, unchanged; only the ingest-side variable name differs. **Do not introduce a third name**; keep passing `sourceIdentity` at every call site in `ingest.ts`.
+
+The v2 plan claimed Step 8a was "idempotent — same key same value" on the cold-start (miss) path. That claim was wrong: on cold start, if we only rebind the cache under the `if (cachedFiles !== null)` branch, the pipeline-end `saveIngestCache` at line 1227 stores the *old* hash (of `sourceContent`) while disk holds the *new* content (`workingSourceContent`). Source-watch reenqueue then misses the cache and re-runs the whole pipeline. The v3 fix is to **propagate `workingSourceContent` through the entire downstream pipeline** so every hash computation uses the current on-disk state.
 
 ```typescript
-// ── Step 0.4: Localize remote markdown image URLs (md inputs only) ─
+// ── Step 0.4: Localize markdown image references (md inputs only) ──
 //
-// Downloads http/https images referenced by `![alt](url "title")` in the
-// source, writes them under wiki/media/<slug>/, rewrites the raw-sources
-// copy to use local paths, and adds an `image_sources:` frontmatter map
-// for traceability. Idempotent — re-runs recognize the `-<sha8>` marker
-// and skip. Skipped for non-md sources (PDF/DOCX/... have their own
-// image path) and when multimodalConfig.enabled or .localizeMarkdownImages
-// is false.
+// Per the decision matrix (§1): every ![alt](url "title") in the source
+// gets its bytes localized to wiki/media/, and its alt/title filled in
+// by the VLM only when the author left alt empty. Runs on both cache-
+// miss and cache-hit paths; the rebind below closes the cache loop.
 
 let workingSourceContent = sourceContent
 let markdownLocalizedImages: SavedImage[] = []
@@ -272,30 +333,16 @@ if (
         }),
     })
 
-    if (result.rewrittenMarkdown !== sourceContent) {
+    if (result.rewrittenSourceMarkdown !== sourceContent) {
       // Write the localized body back to the raw-sources copy. This
-      // will trigger source-watch, but the cache-key update below
-      // (Step 8a) ensures the follow-up ingest is a cache-hit no-op.
-      await writeFile(sp, result.rewrittenMarkdown)
-      workingSourceContent = result.rewrittenMarkdown
+      // will trigger source-watch, but the rebind below ensures the
+      // follow-up ingest is a cache-hit no-op.
+      await writeFile(sp, result.rewrittenSourceMarkdown)
+      workingSourceContent = result.rewrittenSourceMarkdown
 
-      // Step 8a: refresh the ingest-cache entry NOW, before source-watch
-      // re-enqueues this file. The follow-up ingest will compute
-      // hash(workingSourceContent), find it equal to the just-saved
-      // entry, and return the cached filesWritten — zero-cost.
-      //
-      // On first-time ingest (miss path) this is a redundant save because
-      // the pipeline will save again at completion; that's fine — same
-      // key, same value, idempotent.
-      //
-      // On cache-hit path, this converts what would otherwise be a
-      // second full pipeline run into a hit on the very next event.
-      const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceContent)
-      if (cachedFiles !== null) {
-        // We came in as a cache hit but our rewrite invalidated the key.
-        // Re-bind the same filesWritten list under the new hash.
-        await saveIngestCache(pp, sourceIdentity, workingSourceContent, cachedFiles)
-      }
+      // From here on, EVERY downstream operation that reads source
+      // content or computes a cache key MUST use workingSourceContent,
+      // not sourceContent. See the "unified propagation" section below.
     }
 
     markdownLocalizedImages = result.savedImages
@@ -304,40 +351,63 @@ if (
       `[ingest:localizer] failed for "${fileName}":`,
       err instanceof Error ? err.message : err,
     )
-    // Non-fatal: fall through with the original content.
+    // Non-fatal: fall through with the original content
+    // (workingSourceContent stays === sourceContent).
   }
 }
+
+// ── existing line 729: cache check now uses workingSourceContent ──
+const cachedFiles = await checkIngestCache(pp, sourceIdentity, workingSourceContent)
+//                                                             ^^^^^^^^^^^^^^^^^^^^^^
+//                                                             was: sourceContent
 ```
+
+**Unified propagation (Commit 5 scope):** the following existing call sites in `autoIngestImpl` must switch from `sourceContent` to `workingSourceContent`:
+
+| Line | Current call | v3 call |
+|---|---|---|
+| 729 | `checkIngestCache(pp, sourceIdentity, sourceContent)` | `checkIngestCache(pp, sourceIdentity, workingSourceContent)` |
+| 738 | `extractAndSaveMarkdownImages(pp, sp, sourceContent, sourceSummarySlug)` | **remove call** — see coordination note below |
+| 767 | `appendSavedImageRefsForCaption(sourceContent, savedImages)` | `appendSavedImageRefsForCaption(workingSourceContent, savedImages)` — plus special-case, see coordination note |
+| 836 | `extractAndSaveMarkdownImages(pp, sp, sourceContent, sourceSummarySlug)` (full-pipeline branch) | **remove call** — see coordination note below |
+| 1227 | `saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths)` | `saveIngestCache(pp, sourceIdentity, workingSourceContent, writtenPaths)` |
+
+Any other read of `sourceContent` after Step 0.4 that eventually gets fed to a wiki-side pipeline (LLM generation prompt, embedding input) should also switch to `workingSourceContent`. Grep for `sourceContent` in `ingest.ts` at Commit 5 time and audit each hit.
+
+**Coordination with `extractAndSaveMarkdownImages`:** when `localizeMarkdownImages` is enabled (`mmCfg.localizeMarkdownImages === true`), local relative paths are already handled by the localizer's `local-relative` classification (§1 decision matrix). Calling `extractAndSaveMarkdownImages` after Step 0.4 would:
+- Duplicate the copyFile work (same file, same target dir).
+- Miss the localizer's `-<sha8>` naming — creating a second file with the old naming pattern.
+- Never touch the VLM (that function doesn't caption), leaving empty-alt local images uncaptioned even when the localizer would have captioned them.
+
+So when `mmCfg.enabled && mmCfg.localizeMarkdownImages`, **skip the `extractAndSaveMarkdownImages` call** in both the cache-hit branch (line 738) and the full-pipeline branch (line 836). When the localizer is disabled (either master toggle or feature toggle off), the old call remains — that's the legacy path.
+
+`appendSavedImageRefsForCaption` at line 767 is caching-related; check its semantics at Commit 5 time and decide whether the localized `savedImages` need it (they may not, since the localizer already captioned them and the caption cache is populated).
 
 **Cache mechanics — how the loop closes:**
 
-The core insight (thanks to review round 2): the ingest cache stores a `hash → filesWritten` mapping under `sourceIdentity`. When the localizer changes the raw-sources copy from v1 to v2, the naive outcome is:
+- Old key: `hash(v1) → filesWritten` (from a pre-v3 ingest, if any).
+- Step 0.4 writes v2 to `raw/sources/<slug>.md` and sets `workingSourceContent = v2`.
+- Cache check at line 729 uses `hash(v2)` — miss on first ingest with v3.
+- Pipeline runs, produces `writtenPaths`.
+- Line 1227 `saveIngestCache(pp, sourceIdentity, workingSourceContent, writtenPaths)` binds `hash(v2) → writtenPaths`.
+- Source-watch reenqueues → reads v2 → `hash(v2)` → **hit** → done.
 
-- Old key: `hash(v1) → filesWritten`
-- Reality on disk: v2
-- Next ingest: `hash(v2)` — miss → run full pipeline again → miss self-heals but wastes one run
+For **repeat ingests within the URL cache TTL**, the localizer's Axis A cache short-circuits happen inside `localizeMarkdownImages`: URL cache hits skip the network, SHA cache hits skip the VLM, `already-localized` skips everything. So `workingSourceContent` is byte-identical to `sourceContent` on second run — the ingest cache hits at line 729 and the whole `autoIngestImpl` returns early. First-time ingest with v3 pays for one full-pipeline run; every subsequent ingest is a cache hit.
 
-The fix is to **rebind the same `filesWritten` under `hash(v2)`** the moment we've written v2. `saveIngestCache` does exactly this. After that point:
-
-- Source-watch reenqueues → read v2 → compute `hash(v2)` → **hit** → return `filesWritten` → done, zero VLM/HTTP/writes
-- User re-imports later → same result — hit
-- User flips a config field that we track in the cache key (see below) → miss → pipeline runs → key rebinds
-
-**Cache-key composition (Commit 5 change):** the current cache key is just `sha256(sourceContent)`. To make the cache correctly invalidate when the user toggles `localizeMarkdownImages` from `false` to `true`, extend the hashed material to include a small fingerprint of the localizer-relevant config:
+**Cache-key composition (Commit 1 change):** the current key is just `sha256(sourceContent)`. To make the cache correctly invalidate when the user toggles `localizeMarkdownImages`, extend the hashed material:
 
 ```
-hashInput = sourceContent + "\n\n---cache-fingerprint---\n" +
+hashInput = content + "\n\n---cache-fingerprint---\n" +
             "localize=" + (mmCfg.localizeMarkdownImages ? "1" : "0") + "\n"
 ```
 
-That's a two-line change in `ingest-cache.ts:sha256` call sites. `minImagePixelSize` and `urlCacheTtlDays` are not part of the fingerprint — they only affect whether individual images get captioned or refetched, not the shape of the output; changing them mid-project shouldn't force a full re-ingest. Locking the fingerprint to only the enable/disable toggle keeps the API stable and the invalidation surface minimal.
+(where `content` is whatever the caller passes — `sourceContent` today, `workingSourceContent` after Commit 5). Two-line change in `ingest-cache.ts`. `minImagePixelSize` and `urlCacheTtlDays` are not part of the fingerprint — they only affect per-image behavior, not output shape, and changing them mid-project shouldn't force a full re-ingest.
 
-**Source-watch reenqueue:** the write in Step 0.4 will trigger source-watch. That's fine — the Step 8a rebind ensures the reenqueued ingest is an I/O-free cache hit. The activity panel will show an extra ingest entry per localized file on the first ingest after the feature ships; that's the visible price of a one-shot backfill and is acceptable. If we later want to hide it, add an in-flight self-write suppression set to `project-file-sync`; deferred to Phase 3.
+**Source-watch reenqueue:** the write in Step 0.4 will trigger source-watch. That's fine — the workingSourceContent propagation ensures the reenqueued ingest is an I/O-free cache hit. The activity panel will show an extra ingest entry per localized file on the first ingest after the feature ships; that's the visible price of a one-shot backfill and is acceptable. If we later want to hide it, add an in-flight self-write suppression set to `project-file-sync`; deferred to Phase 3.
 
-**No cache-hit special branch for the localizer:** the localizer runs before `checkIngestCache`, uniformly. Placing it after the cache check would either mean (a) old localized data never gets re-localized after config changes, or (b) we split the localizer into two call sites. Uniform placement is simpler and, thanks to Step 8a, has the same performance envelope.
+**Wiki-page seeding:** `result.rewrittenWikiMarkdown` is used downstream when we write to `wiki/sources/<slug>.md`. The current flow feeds `sourceContent` (or its processed variant) into the LLM generation prompt; that prompt needs to see the wiki-form of image references so the LLM preserves them in its output. Commit 5 audits the exact seeding point (candidate: `ingest.ts:~1000` where the generation prompt is assembled) and switches its input to `workingWikiSourceContent = result.rewrittenWikiMarkdown` when localization ran.
 
 Downstream implications:
-- `extractAndSaveMarkdownImages` (line 738) still runs for local relative refs — the localizer only touches remote and data URIs, not `![](../assets/x.png)`.
 - `markdownLocalizedImages` is concatenated with the existing `savedImages` list at Step 5 so `injectImagesIntoSourceSummary` sees every image.
 - `injectImagesIntoSourceSummary` appends its `## Embedded Images` safety-net section. To avoid double-listing images already visible in the body, its inject helper skips URLs already present in the body (existing helper behavior — confirm during Commit 5).
 
@@ -384,14 +454,17 @@ Every remote URL passes through:
 1. `validateHttpUrl` — scheme = http/https, no embedded credentials
 2. `isPrivateNetworkHost` — SSRF: no private IPs, no localhost, no metadata endpoints (169.254.169.254 etc)
 3. `fetchImportUrl` — MAX_REDIRECTS=10, redirect can't cross public → private boundary, `redirect: 'manual'` with explicit redirect loop
-4. Content-Type response header check: must start with `image/`; otherwise reject
-5. Size cap: reject bodies > 20 MB (new constant; no upstream analog to reuse). Prevents accidental download of a 4K video file linked as an image.
-6. Timeout: 15s connect + read (`AbortSignal.timeout(15000)`)
-7. **Data URI:** decoded size > 20 MB rejected; MIME must be `image/*`; malformed base64 rejected. Applied by `resolveDataUri` in the localizer, mirrors the HTTP path's guardrails.
+4. **Response headers preflight**, in this order:
+   - `Content-Type` must start with `image/`; otherwise reject before body read.
+   - `Content-Length`, if present and > 20 MB, reject before body read. Missing `Content-Length` is OK (chunked encoding); body-size cap catches it.
+5. **Body size cap**: reject bodies > 20 MB during streaming read. Prevents accidental download of a 4K video file linked as an image, and catches missing/lying `Content-Length` at the streaming layer.
+6. **Timeout**: 30s connect + read (`AbortSignal.timeout(30_000)`). Chosen over 15s because CN → international image hosts (githubusercontent, cloudflare CDN, etc.) frequently exceed 15s from CJK-locale networks; 30s covers the p99 without blocking on genuinely unresponsive hosts. Configurable via `multimodalConfig.imageFetchTimeoutMs` (default 30_000, not in Phase 1 UI panel).
+7. **Data URI**: decoded size > 20 MB rejected; MIME must be `image/*`; malformed base64 rejected. Applied by `resolveDataUri` in the localizer, mirrors the HTTP path's guardrails.
+8. **Local relative path**: resolves through `isInsideProject` — resolved absolute path must stay under `projectPath`. Rejects `../../../etc/passwd`-style traversal. Missing files counted as `failed`, not `unsupported` (they were referenced as local; the file just isn't there).
 
 ### 11. Frontmatter `image_sources:` mapping (was Phase 3, now Phase 1)
 
-For every localized image, the raw-sources copy's frontmatter carries a `image_sources:` block:
+For every localized image that came from a **remote URL**, the raw-sources copy's frontmatter carries an `image_sources:` block mapping the local path back to its remote origin:
 
 ```yaml
 ---
@@ -401,7 +474,25 @@ image_sources:
 ---
 ```
 
-Populated by `mergeImageSourcesFrontmatter` (§6). Preserves any other frontmatter keys the user has authored (uses `parseFrontmatter` which returns `rawBlock` for round-tripping the untouched YAML).
+**Which images get entries** (v3 clarification):
+
+| URL kind | Frontmatter entry |
+|---|---|
+| `remote-http` | Yes — value is the original URL |
+| `data-uri` | Yes — value is the data URI **truncated to the first 64 chars + `…`** (rationale: full base64 in YAML bloats the file to hundreds of KB; the traceability value of a data URI is essentially zero because it isn't clickable anyway, but keeping a truncated marker distinguishes "this was inline base64" from "this was remote") |
+| `local-relative` | No — the original path was already relative to the source; storing the local path AS its own origin adds nothing |
+| `already-localized` | No — mapping unchanged from a previous run; entry preserved verbatim during merge (see below) |
+
+**Lifecycle rules** (v3, addresses value-1 review finding):
+
+1. **Populate** at end of each successful Step 0.4 run:
+   - Compute the target mapping = union of (this-run's `remote-http` and `data-uri` entries) ∪ (already-existing entries in frontmatter whose local path is still referenced somewhere in the body).
+   - Emit that mapping into frontmatter, replacing any previous `image_sources:` block. This is a **full-rewrite semantics**, not "append/merge without pruning".
+2. **User manually deletes an image reference in body** — next re-ingest sees that local path is no longer referenced; the entry drops from the mapping.
+3. **User replaces a remote URL with another remote URL, same SHA** — new entry with the new URL is added; old entry is dropped (because its local path is no longer referenced — the local path changes when SHA changes; here we hypothesized no SHA change, but URL changed anyway, so the previous URL's local path IS the same local path, and it stays with the newer URL as value).
+4. **User toggles `localizeMarkdownImages: true → false → true`** — the false step doesn't run Step 0.4, so nothing touches frontmatter. On re-enable, next ingest rewrites according to rule 1.
+5. **User authors their own `image_sources:` key for another purpose** — collision. Merge helper **loses the user's data** if it uses the same key name. Documented behavior: the key `image_sources:` is owned by the localizer; if users have another use for it, they must rename theirs. UI panel in Phase 3 will surface this in help text.
+6. **Merge implementation:** use `parseFrontmatter` to get `{ frontmatter, body, rawBlock }`. Compute the new `image_sources:` object. Serialize the merged frontmatter (preserving the values of all OTHER keys verbatim from `frontmatter`, but replacing/removing `image_sources:` per rule 1) via a targeted YAML edit — do NOT dump the whole object via `yaml.dump()` because that reformats every key. Simplest implementation: locate the `image_sources:` block in `rawBlock` by regex, replace or delete it in place; if it doesn't exist, prepend it before the closing `---`. Round-trips other keys with zero drift.
 
 The mapping is one-way (`local → original`). Purpose:
 - Traceability: users who want to know "where did this image come from" have a machine-readable record.
@@ -449,79 +540,138 @@ Zero deletions. All modifications are additive; existing behavior when `localize
 ### Unit tests (`markdown-image-localizer.test.ts`)
 
 Mock:
-- `getHttpFetch` → a hand-written fetch stub with per-URL response fixtures
+- `getHttpFetch` → a hand-written fetch stub with per-URL response fixtures (headers + body)
 - `captionImage` → deterministic stub returning `{ caption: 'CAP_' + hash8, title: 'T_' + hash8 }`
-- `writeFileBase64`, `writeFile`, `readFile`, `createDirectory`, `fileExists` → in-memory VFS
+- `writeFileBase64`, `writeFile`, `readFile`, `copyFile`, `createDirectory`, `fileExists` → in-memory VFS
 - `createImageBitmap` → mockable probe helper (see §2 test note)
 
 Test cases (each 2-5 min to implement, TDD one at a time):
+
+**Group A — regex + classification (Commit 3):**
 
 1. `MD_IMAGE_RE_WITH_TITLE` matches all shapes:
    - `![](url)` — no alt, no title
    - `![alt](url)` — alt, no title
    - `![alt](url "title")` — full
    - `![alt](url 'title')` — single-quoted title
-   - `![alt with ] fun](url)` — bracket in alt should fail gracefully
+   - `![alt with \] fun](url)` — escaped bracket in alt (accepted per Commonmark)
    - `<img>` HTML → not matched
-2. URL classification:
+2. URL classification (resolve → regex → exists, per §5):
    - `https://example.com/foo.png` → `remote-http`
    - `data:image/png;base64,iVBOR...` → `data-uri`
-   - `../assets/x.png` → `local-relative`
+   - `../assets/x.png` → `local-relative` (file exists at resolved absolute path)
+   - `../assets/missing.png` → **`failed`** (file doesn't exist; distinct from `unsupported`)
    - `../../wiki/media/notes/foo-abc12345.png` (file exists) → `already-localized`
-   - `../../wiki/media/notes/foo-abc12345.png` (file missing) → `local-relative` (§5 two-step)
+   - `../../wiki/media/notes/foo-abc12345.png` (file missing) → `local-relative` (§5 fall-through)
+   - `../../../../etc/passwd` (path traversal) → `failed` (rejected by isInsideProject)
    - `ftp://x/y` → `unsupported`
-3. Toggle `false` — module never called (integration-level, covered by Commit 5).
-4. Toggle `true` — end-to-end: download, save, caption, rewrite alt/title, rewrite url to local path.
-5. Frontmatter `image_sources:` populated correctly, with existing YAML preserved untouched.
-6. Below-threshold image downloads but skips VLM (caption stays original).
-7. URL cache TTL fresh — no HTTP call.
-8. URL cache TTL expired but SHA stable — HTTP call, no VLM call, `fetchedAt` bumped.
-9. URL cache miss + SHA cache hit — no re-download of file (copy from canonical), no VLM.
-10. Cold path — HTTP + VLM + file write + both caches updated.
-11. SSRF: `http://192.168.1.1/x.png` → rejected, no fetch attempted.
-12. Redirect from public to private host → rejected.
-13. Body > 20 MB → rejected.
-14. Content-Type `text/html` → rejected.
-15. Timeout → returned as failed, other images continue.
-16. Concurrency: 10 remote URLs with `mmCfg.concurrency = 3` → at most 3 in-flight fetches (spy on the stub).
-17. Idempotency (within TTL): run twice on the same markdown → second run does no HTTP calls, no VLM calls, output identical.
-18. Data URI: decoded, saved as local file, SHA-tracked, captioned like any other image. Malformed base64 → failed. Decoded > 20 MB → failed.
-19. Failure isolation: one URL 404s, other 5 URLs still succeed.
-20. Title escaping: caption containing `"` gets curly-quoted in written markdown.
-21. Codex-CLI provider → download + save + rewrite links run; caption step skipped; alt stays original; `stats.captioned = 0`.
+
+**Group B — VLM gating axis (Commit 4, v3 core):**
+
+3. **Author alt non-empty + remote URL** → download + rewrite URL; alt/title preserved verbatim; `stats.skippedAuthorAlt === 1`, `stats.captioned === 0`.
+4. **Author alt empty + remote URL + over threshold** → download + VLM; alt & title filled by VLM; `stats.captioned === 1`.
+5. **Author alt empty + remote URL + under threshold** → download + rewrite URL; alt stays empty (not `null`, not `""` inserted, literally empty match group); title stays whatever author had; `stats.skippedTooSmall === 1`, `stats.captioned === 0`.
+6. **Author alt non-empty + local relative** → copyFile + rewrite URL; author alt preserved; `stats.copied === 1`, `stats.captioned === 0`.
+7. **Author alt empty + local relative + over threshold** → copyFile + VLM + rewrite URL and alt; `stats.copied === 1`, `stats.captioned === 1`.
+8. **Author alt non-empty + data URI** → decode + write + rewrite URL; alt preserved; frontmatter carries truncated data URI entry.
+9. **Author alt has only whitespace `"  \t\n  "`** — treated as empty (author intent: no accessibility text). VLM runs.
+10. **Author alt is `"image"` (single generic word)** — treated as non-empty per v3 spec. Rationale: we can't second-guess author intent. Users who want the VLM should leave alt empty.
+
+**Group C — frontmatter lifecycle (Commit 4, addresses value-2):**
+
+11. Frontmatter `image_sources:` populated with 2 remote URLs + 1 truncated data URI; local-relative image gets no entry; existing untouched YAML keys preserved verbatim (whitespace, comments, ordering).
+12. Re-ingest where 1 of the 2 remote images was manually deleted from body → `image_sources:` drops that entry.
+13. User authored their own `image_sources:` key → merged blob overwrites it. Emits a warning to console (documented behavior).
+
+**Group D — caching (Commit 3):**
+
+14. URL cache TTL fresh — no HTTP call, `stats.urlCacheHits === 1`.
+15. URL cache TTL expired but SHA stable — HTTP call, no VLM call, `fetchedAt` bumped, `stats.captionCacheHits === 1`.
+16. URL cache miss + SHA cache hit — no re-download of file (copy from canonical), no VLM, `stats.captionCacheHits === 1`.
+17. Cold path — HTTP + VLM + file write + both caches updated.
+
+**Group E — network defense (Commit 3):**
+
+18. SSRF: `http://192.168.1.1/x.png` → rejected, no fetch attempted.
+19. Redirect from public to private host → rejected.
+20. Response `Content-Length: 500000000` → rejected before body read (verify via stub call count: HEAD-shaped scenario).
+21. Body streams past 20 MB when `Content-Length` was missing/lying → aborts mid-stream.
+22. Content-Type `text/html` → rejected.
+23. Timeout at 30s → returned as failed, other images continue.
+
+**Group F — concurrency + isolation + escape (Commit 4):**
+
+24. Concurrency: 10 remote URLs with `mmCfg.concurrency = 3` → at most 3 in-flight fetches (spy on the stub).
+25. Idempotency (within TTL): run twice on the same markdown → second run does no HTTP calls, no VLM calls, output identical.
+26. Data URI happy path: decoded, saved as local file, SHA-tracked, VLM-captioned when alt empty and above threshold. Malformed base64 → failed. Decoded > 20 MB → failed. Frontmatter entry is truncated to 64 chars + `…`.
+27. Failure isolation: one URL 404s, other 5 URLs still succeed.
+28. Title escape (generator side): VLM returns caption containing `"` → written markdown uses `\u201D` curly quote, not `\"`. Verify parser round-trips.
+29. Alt escape (generator side): VLM returns alt containing `]` → written markdown uses `\]`. Alt with newline → single space.
+30. Codex-CLI provider → download/copy + rewrite links run; VLM step skipped for empty-alt images; alt stays original (empty); `stats.captioned === 0`. `stats.copied` / `stats.downloaded` reflect actual I/O.
 
 ### Cache-fingerprint tests (`ingest-cache.test.ts` — extend existing)
 
 - Cache hit when `localizeMarkdownImages` unchanged.
 - Cache miss when the field flips `false → true`, even with byte-identical source content.
+- Cache miss when `sourceContent` changes but `localizeMarkdownImages` unchanged.
+
+### Integration tests for the two-form output (`markdown-image-localizer.test.ts`)
+
+31. `rewrittenSourceMarkdown` image refs use `../../wiki/media/...` form.
+32. `rewrittenWikiMarkdown` image refs use `../media/...` form.
+33. Both share the same `image_sources:` frontmatter block.
+34. Both share the same alt/title text (only the URL differs between them).
 
 ### Integration (manual smoke)
 
-Create a fixture markdown file in a scratch project:
+Create a fixture markdown file in a scratch project. **The fixture must exercise all four cells of the v3 decision matrix** so we can visually confirm alt preservation vs generation:
 
 ```markdown
 # My notes
 
+<!-- Cell 1: empty alt + remote URL — VLM runs, alt filled -->
 ![](https://raw.githubusercontent.com/rust-lang/rust-artwork/master/logo/rust-logo-blk.svg)
 
-Some prose about the ferris mascot.
+<!-- Cell 2: non-empty alt + remote URL — VLM skipped, alt preserved -->
+![The Ferris mascot — an orange crab representing the Rust programming language](https://picsum.photos/id/237/400/300 "Ferris in profile")
 
-![existing alt](https://picsum.photos/id/237/400/300 "existing title")
+<!-- Cell 3: empty alt + local relative — VLM runs, alt filled, copyFile used -->
+![](./local-diagram.png)
 
-Small icon:
+<!-- Cell 4: non-empty alt + local relative — VLM skipped, alt preserved, copyFile used -->
+![System architecture: three-tier with React frontend, Rust backend, SQLite storage](./architecture.svg)
 
-![](https://placehold.co/16x16.png)
+<!-- Threshold: empty alt + tiny image — download but no VLM -->
+Small icon: ![](https://placehold.co/16x16.png)
+
+<!-- Data URI: empty alt + inline base64 (create a tiny valid PNG) -->
+![](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==)
 ```
 
-Ingest via the UI. Verify:
+Prepare `./local-diagram.png` and `./architecture.svg` in the source directory before ingest.
 
-- After ingest, the raw-sources copy has:
-  - `image_sources:` frontmatter with three entries mapping local paths to original URLs
-  - Body has three `![vlm-alt](../../wiki/media/<slug>/... "vlm-title")` (or `![](...)`. for the small icon whose VLM was skipped) references
-- `wiki/media/<slug>/` contains 3 files with `-<sha8>.<ext>` suffixes
-- `wiki/sources/<slug>.md` has the same body with `../media/<slug>/...` relative paths
-- `.llm-wiki/image-url-cache.json` has 3 entries
-- `.llm-wiki/image-caption-cache.json` has 2 entries (small icon skipped VLM)
+Ingest via the UI. Verify by inspecting `raw/sources/<slug>.md`:
+
+- `image_sources:` frontmatter has **entries only for remote URLs and data URIs** (Cells 1 & 2 remote entries + truncated data-URI entry). Local-relative entries (Cells 3 & 4) do NOT appear in the mapping (per §11 v3 lifecycle).
+- Body has 6 image references, all `../../wiki/media/<slug>/... "..."` form:
+  - Cell 1 alt is VLM-generated text like "The Rust programming language logo — a stylized R"
+  - Cell 2 alt is **byte-identical to author's input**: "The Ferris mascot — an orange crab..." — and title is "Ferris in profile"
+  - Cell 3 alt is VLM-generated
+  - Cell 4 alt is **byte-identical to author's input**: "System architecture: three-tier..."
+  - Small icon has empty alt `![]` still (VLM skipped, threshold), URL rewritten to local
+  - Data URI has VLM-generated alt (assuming above threshold)
+- `wiki/media/<slug>/` contains **6 files** with `-<sha8>.<ext>` suffixes
+- `wiki/sources/<slug>.md` has the same body with `../media/<slug>/...` (single-`../`) relative paths
+- `.llm-wiki/image-url-cache.json` has **3 entries** (Cells 1 & 2 remotes + the small placeholder; local files don't cache-URL)
+- `.llm-wiki/image-caption-cache.json` has **4 entries** — VLM ran for: Cell 1, Cell 3, data URI. Cell 2, Cell 4 skipped due to author alt; small icon skipped due to threshold. So actually **3 entries**. (Adjust based on which cells hit the VLM.)
+- `stats` returned by the localizer:
+  - `downloaded: 3` (Cells 1, 2, small icon — Cell 2 downloads even though VLM skips)
+  - `copied: 2` (Cells 3, 4)
+  - `decoded: 1` (data URI)
+  - `alreadyLocalized: 0` (first ingest)
+  - `captioned: 3` (Cell 1, Cell 3, data URI)
+  - `skippedAuthorAlt: 2` (Cells 2, 4)
+  - `skippedTooSmall: 1` (small icon)
 - Activity panel likely shows two ingest entries: first is the real run, second is the source-watch reenqueue which cache-hits and completes in milliseconds
 - Third ingest (via re-import) — one entry, cache hit, no network, no VLM, no writes
 
@@ -529,7 +679,8 @@ Ingest via the UI. Verify:
 
 - `npm run test` — full suite must pass, especially `src/lib/image-caption-pipeline.test.ts` (existing 21 cases untouched by our regex change since we ship a new regex, not replace the old one)
 - `npm run typecheck` — zero errors
-- Manual: ingest a PDF unrelated to markdown — Step 0.4 is skipped, PDF path unchanged
+- Manual: ingest a PDF unrelated to markdown — Step 0.4 is skipped, PDF path unchanged, `captionMarkdownImages` still aggressively overwrites placeholder alt (that's correct for PDF; see v3 framing note at top of doc)
+- Manual: ingest a markdown that has ONLY local-relative images with author alts — Step 0.4 runs, does zero network I/O, zero VLM calls, `stats.copied === N`, `stats.captioned === 0`, `stats.skippedAuthorAlt === N`, body is byte-identical to source except for the URL substitution
 - Manual: flip `localizeMarkdownImages = false`, re-ingest an existing markdown — first ingest cache-misses (fingerprint changed), pipeline runs but localizer is bypassed, result reverts to remote URLs in the body
 
 ---
@@ -538,15 +689,15 @@ Ingest via the UI. Verify:
 
 | # | Scope | Files | Test gate |
 |---|---|---|---|
-| 1 | `MultimodalConfig` schema + defaults; cache-fingerprint composition | `src/stores/wiki-store.ts`, `src/lib/ingest-cache.ts` + extended test | typecheck; `ingest-cache.test.ts` incl. new cases |
-| 2 | `CaptionEntry` optional fields, forward-compat | `src/lib/image-caption-pipeline.ts` | existing caption tests |
-| 3 | Localizer module — core (URL cache, download, SHA dedup, no VLM yet) | `src/lib/markdown-image-localizer.ts`, part of `markdown-image-localizer.test.ts` (tests 1, 2, 6-14, 18-19) | new module tests |
-| 4 | Localizer — VLM caption path + rewrite + frontmatter mapping | rest of `markdown-image-localizer.ts` + `.test.ts` (tests 3, 4, 5, 15-17, 20, 21) | all new module tests |
-| 5 | `autoIngestImpl` integration (Step 0.4 + Step 8a rebind) | `src/lib/ingest.ts` | full `npm run test` + smoke ingest |
+| 1 | `MultimodalConfig` schema + defaults (add `localizeMarkdownImages`, `minImagePixelSize`, `urlCacheTtlDays`, `imageFetchTimeoutMs`); cache-fingerprint composition | `src/stores/wiki-store.ts`, `src/lib/ingest-cache.ts` + extended test | typecheck; `ingest-cache.test.ts` incl. new fingerprint cases |
+| 2 | `CaptionEntry` optional fields (title, originalUrl), forward-compat | `src/lib/image-caption-pipeline.ts` | existing 21 caption tests stay green |
+| 3 | Localizer module — **core plumbing** (URL classification with 3-step already-localized check, URL cache w/ per-entry upsert, HTTP download with SSRF + Content-Length + timeout defense, copyFile local path, data URI decode w/ truncation, SHA-256 dedup, `resolveLocalRelative` w/ `isInsideProject`, NO VLM yet) | `src/lib/markdown-image-localizer.ts`, first half of `markdown-image-localizer.test.ts` (Groups A, D, E — tests 1-2, 14-23) | new module tests |
+| 4 | Localizer — **decision matrix + VLM + rewrite + frontmatter** (§1 axis-B gating, `captionImage` integration with codex-cli fallback, both `rewrittenSourceMarkdown` and `rewrittenWikiMarkdown` outputs via §7 regex + §4 path helper, `parseFrontmatter` merge with §11 lifecycle rules, generator-side escape) | rest of `markdown-image-localizer.ts` + rest of `.test.ts` (Groups B, C, F + integration tests — tests 3-13, 24-34) | all new module tests |
+| 5 | `autoIngestImpl` integration (Step 0.4 hook + `workingSourceContent` propagation across 5 call sites; skip `extractAndSaveMarkdownImages` when localizer enabled; wire `rewrittenWikiMarkdown` into wiki-page seeding) | `src/lib/ingest.ts` | full `npm run test` + smoke ingest per fixture above |
 
 Commit 1 covers the cache-fingerprint change because it's a self-contained, low-risk 2-line diff that Commit 5's integration depends on. Doing it upfront lets Commit 5 focus purely on the ingest hook.
 
-Each commit is independently mergeable and reversible.
+Each commit is independently mergeable and reversible. Commits 3-4 split the localizer at a natural seam (network/FS I/O vs policy/VLM) so a bisect on Commit 4 doesn't pull in Commit 3's changes.
 
 ---
 
@@ -554,15 +705,18 @@ Each commit is independently mergeable and reversible.
 
 | # | Risk | Severity | Mitigation |
 |---|---|---|---|
-| 1 | Source-watch reenqueue after localizer writes — activity panel shows a redundant entry | LOW | Step 8a rebind makes the reenqueued ingest an I/O-free cache hit. UX polish deferred to Phase 3. |
+| 1 | Source-watch reenqueue after localizer writes — activity panel shows a redundant entry | LOW | `workingSourceContent` propagation makes the reenqueued ingest an I/O-free cache hit. UX polish deferred to Phase 3. |
 | 2 | Remote server serves different content on re-fetch (SHA change) | LOW-MED | 45-day TTL naturally revalidates; SHA-change path creates a new file with new suffix, no silent overwrite |
 | 3 | Very large image (10 MB PNG) → base64 IPC round-trip cost | LOW | 20 MB body cap catches abuse; typical hero image is <500 KB |
-| 4 | VLM cost for a giant markdown corpus | MED | SHA cache eliminates duplicates; user can flip `localizeMarkdownImages = false` for large batch imports; Phase 2 resize cuts per-caption cost |
+| 4 | VLM cost for a giant markdown corpus | MED | SHA cache eliminates duplicates; **author-alt-non-empty skip** eliminates already-accessible images; user can flip `localizeMarkdownImages = false` for large batch imports; Phase 2 resize cuts per-caption cost |
 | 5 | Cache file corruption / partial writes | LOW | Both caches upsert per-image. Corrupt cache = warn + start fresh (existing pattern in `image-caption-pipeline.ts:105`). |
 | 6 | User disables the feature after using it — localized files stay in `wiki/media/` and body still references them | LOW | Same as PDF-extracted images today. `cascadeDeleteWikiPage` reaps on source deletion. No proactive cleanup — flipping the toggle off doesn't revert the raw-sources copy. Documented behavior. |
 | 7 | Concurrency thundering herd on a slow origin | LOW | Download pool capped at `min(4, mmCfg.concurrency)` |
 | 8 | Data URI in markdown expands to >20MB after base64 decode | LOW | `resolveDataUri` rejects; failure counted, other images continue |
-| 9 | Frontmatter merge collides with a user-authored `image_sources` key | LOW | Merge helper preserves user keys under any other name; if the user already uses `image_sources` for something else, they should rename theirs. Documented in Phase 3 UI panel. |
+| 9 | Frontmatter merge collides with a user-authored `image_sources` key | LOW | Localizer owns the key; user must rename. Documented per §11 rule 5. |
+| 10 | User's authored alt is a placeholder like `"image"` or `"figure 3"` — v3 spec preserves it verbatim, missing an accessibility improvement opportunity | LOW-MED | Documented per §1 Rationale #1 ("VLM is a gap-filler, not a rewriter"). Users who want VLM to run must leave alt empty. Phase 3 UI could offer a "re-caption anyway" button per image. |
+| 11 | Two `LocalizeResult` outputs — implementation forgets to feed `rewrittenWikiMarkdown` to the wiki-page seeder and wiki page ends up with wrong-form paths | MED | Commit 5 explicit audit step; integration test #31-32 verifies both forms; TypeScript catches missing field access if the seeder function requires it |
+| 12 | `workingSourceContent` propagation missed at one of 5 call sites — cache thrashes on cold start | MED | Commit 5 checklist has all 5 sites; grep-audit step in the commit plan; test-level: cache-fingerprint test detects the specific loop-close bug |
 
 **Open questions:** None. All post-review decisions are captured above.
 
@@ -573,9 +727,13 @@ Each commit is independently mergeable and reversible.
 - [ ] `npm run typecheck` clean
 - [ ] `npm run test` — all suites green
 - [ ] `npm run build` — production build succeeds
-- [ ] Smoke test: fixture markdown ingested end-to-end, verified by inspecting `raw/sources/<slug>.md` frontmatter, `wiki/`, `.llm-wiki/*.json`
+- [ ] Smoke test: fixture markdown (with all four decision-matrix cells) ingested end-to-end, verified by inspecting `raw/sources/<slug>.md` body + frontmatter, `wiki/sources/<slug>.md` body, `wiki/media/<slug>/`, `.llm-wiki/*.json`
+- [ ] Author alt preservation: Cells 2 & 4 of the fixture have alt/title byte-identical to input
+- [ ] VLM gap-fill: Cells 1 & 3 of the fixture have alt filled by VLM stub
+- [ ] Two-form output: `wiki/sources/<slug>.md` uses `../media/` paths; `raw/sources/<slug>.md` uses `../../wiki/media/` paths
 - [ ] Idempotency test: third ingest of same file is a no-op (no network, no VLM, no file writes except cache timestamp). Second ingest may show a source-watch reenqueue — that's expected and cache-hits.
-- [ ] Regression: PDF ingest still works (Step 0.4 correctly skipped)
-- [ ] Regression: `localizeMarkdownImages = false` is byte-identical to today's behavior (verified by fingerprint miss + bypassed localizer path)
+- [ ] Regression: PDF ingest still works (Step 0.4 correctly skipped; existing `captionMarkdownImages` still overwrites placeholder alt per v3 framing)
+- [ ] Regression: `localizeMarkdownImages = false` is byte-identical to today's behavior (verified by fingerprint miss + bypassed localizer path); `extractAndSaveMarkdownImages` runs on the legacy path
+- [ ] `sourceContent` audit in `ingest.ts`: `grep -n sourceContent src/lib/ingest.ts` after Commit 5 shows no post-Step-0.4 references that should have been `workingSourceContent`
 - [ ] Cache files documented in `docs/` if we ship a data dictionary (not required for merge, tracked as Phase 3)
 - [ ] `plans/markdown-image-localizer.md` moved to `plans/done/` or updated with **Status: shipped**
