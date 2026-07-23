@@ -1,6 +1,6 @@
 # Markdown image localizer
 
-**Status:** Spec v3.2 (revised 2026-07-23 after third review round — v3.1 fixed 4 CRITICAL spec-vs-code drifts; v3.2 folds in 6 WORTH refinements: source-watch reenqueue semantics, `image_sources:` foreign-entry preservation, fixture arithmetic, probe DI, TOCTOU note, pre-Commit-5 seeding audit). Branch: `feat/markdown-image-localizer`, cut from `main` at `e8bdec6` (upstream v0.6.5 tip).
+**Status:** Spec v3.3 (revised 2026-07-23 after third review round — v3.1 fixed 4 CRITICAL spec-vs-code drifts; v3.2 folded in 6 WORTH refinements; v3.3 clears 4 SMALL details plus one late-caught blocker: mmCfg scope hoist in Commit 5, §7 alt-escape-vs-title-sanitize disambiguation, `imageFetchTimeoutMs` in defaults block, `bytesLen` diagnostic annotation). Branch: `feat/markdown-image-localizer`, cut from `main` at `e8bdec6` (upstream v0.6.5 tip).
 
 **Predecessor:** `plans/multimodal-images.md` — landed the PDF/PPTX/DOCX image-extraction + VLM caption pipeline in v0.6.4. This plan extends the same pipeline to **markdown inputs**.
 
@@ -160,7 +160,7 @@ interface UrlCacheEntry {
   mimeType: string
   width: number         // 0 if unknown (SVG, decode failed)
   height: number
-  bytesLen: number
+  bytesLen: number      // recorded for diagnostics/telemetry; not read by localizer logic in Phase 1
   fetchedAt: string     // ISO 8601
   /** Project-root-relative path of the FIRST place we wrote this
    *  content. Later hits copyFile from here instead of re-downloading. */
@@ -328,9 +328,9 @@ const MD_IMAGE_RE_WITH_TITLE = /(!\[)([^\]]*)(\]\()([^)\s]+)(?:\s+(["'])((?:(?!\
 **Generator side (strict, one form only):**
 
 - The localizer only ever writes `![alt](url "title")` — double-quoted title, single line. Single-quoted or angle-bracket variants are never generated.
-- **Alt sanitization**: `]` in author or VLM alt would break the markdown; replace with `\]`. Newlines in alt → single space. Zero-width chars stripped. Verified pre-write.
-- **Title sanitization**: `"` in title would break the delimiter; replace with `\u201C` (opening curly) or `\u201D` (closing curly) heuristically (or just `\u201D` uniformly — the visual distinction is not preserved from source anyway). Newlines → space. Backticks left as-is (harmless inside titles).
-- **No backslash escaping in generated output** — we sanitize away the problem characters rather than emit `\"`/`\]`. This keeps the generated markdown readable and matches how mineru/pandoc write CJK text.
+- **Alt handling — escape, not sanitize.** `]` in author or VLM alt is written as `\]` (backslash-escape); CommonMark parsers reverse this on read. Newlines in alt collapse to a single space. Zero-width chars (U+200B–U+200D, U+FEFF) stripped. This preserves the author's exact glyphs when they contain `]` — a real risk when a citation-style `[N]` gets embedded in alt text.
+- **Title handling — sanitize, not escape.** `"` in the title is replaced with `\u201D` (closing curly quote) uniformly. Rationale: CommonMark 0.30 §6.7 permits `\"` inside double-quoted titles, but backslashes inside CJK titles render poorly in some downstream tools (the user's environment is Chinese). Curly-quote sanitization is a lossy but visually-clean substitution; the original `"` glyph is *not* recoverable, but titles are decorative, not part of link identity, so the loss is acceptable. Newlines → space. Backticks left as-is.
+- **Why the asymmetry?** Alt text is semantic content (screen-reader output, LLM prompt input) — round-tripping matters, so we take the escape. Title is a hover-tooltip decoration — visual cleanliness matters more than round-trip fidelity, so we take the sanitization.
 
 CJK note: user's environment is Chinese; the curly-quote substitution is safer than backslash-escapes because backslashes inside CJK titles are visually unclear and some downstream renderers mishandle them.
 
@@ -341,6 +341,15 @@ Insert a new **Step 0.4** immediately after source content is read (line ~710) a
 **Line-number convention (v3):** every line number in this section (`~710`, `729`, `738`, `767`, `836`, `1227`) is the current tip anchor at v3 spec time. Commit 5 introduces new lines (the `isMarkdown` binding, the Step 0.4 block itself) which will shift every downstream line by a small offset. Do **not** rely on these line numbers when applying Commit 5 — use `grep` on the symbol names (`checkIngestCache`, `extractAndSaveMarkdownImages`, `appendSavedImageRefsForCaption`, `saveIngestCache`) as the durable anchor. The line numbers here are for orientation only.
 
 **Naming convention (v3):** in `autoIngestImpl` scope, the ingest-cache functions are called with `sourceIdentity` as the second argument. That variable is produced by `sourceIdentityForPath(pp, sp)` at line 649 and is *not* renamed in this plan. The `ingest-cache.ts` implementation calls the same parameter `sourceFileName` (see `ingest-cache.ts:63/100/120`) — that's the historical name of the parameter, unchanged; only the ingest-side variable name differs. **Do not introduce a third name**; keep passing `sourceIdentity` at every call site in `ingest.ts`.
+
+**`mmCfg` scope hoist (v3.3 addition, Commit 5).** The current tip has `const mmCfg = useWikiStore.getState().multimodalConfig` declared twice inside `autoIngestImpl` — once at `ingest.ts:758` in the cache-hit branch, once at `ingest.ts:888` in the full-pipeline branch. Step 0.4 sits at `~710`, before both. Commit 5 must:
+
+1. Move the `mmCfg` declaration up to just after `sourceContent` is read (line ~710), before the Step 0.4 block.
+2. Move the companion `const captionLlm = resolveCaptionConfig(mmCfg, llmConfig)` up alongside it (currently on line 889, inside the full-pipeline branch).
+3. Delete the two duplicate declarations at 758 and 888. All downstream reads (lines 759, 764, 772, 890, 918, 1195) continue to see the hoisted binding.
+4. Same for `mmCfgWrites` at line 3191 — that's outside `autoIngestImpl` (different function scope), leave it alone.
+
+This is a small refactor but must happen **before** Step 0.4 inserts, otherwise `mmCfg.enabled` in the localizer gate is `ReferenceError`. Grep for `useWikiStore.getState().multimodalConfig` inside `autoIngestImpl` to confirm exactly 2 sites need deletion after Step 0.4's version is added.
 
 The v2 plan claimed Step 8a was "idempotent — same key same value" on the cold-start (miss) path. That claim was wrong: on cold start, if we only rebind the cache under the `if (cachedFiles !== null)` branch, the pipeline-end `saveIngestCache` at line 1227 stores the *old* hash (of `sourceContent`) while disk holds the *new* content (`workingSourceContent`). Source-watch reenqueue then misses the cache and re-runs the whole pipeline. The v3 fix is to **propagate `workingSourceContent` through the entire downstream pipeline** so every hash computation uses the current on-disk state.
 
@@ -534,6 +543,9 @@ interface MultimodalConfig {
   /** URL cache TTL in days. On expiry, re-fetch; SHA-stable
    *  re-fetches cost only bandwidth, not VLM calls. */
   urlCacheTtlDays: number
+  /** HTTP fetch timeout in milliseconds for image downloads.
+   *  Wraps AbortSignal.timeout(). Not in Phase 1 UI (§9). */
+  imageFetchTimeoutMs: number
 }
 ```
 
@@ -543,6 +555,7 @@ Defaults (added at the store init, line ~579):
 localizeMarkdownImages: true,
 minImagePixelSize: 100,
 urlCacheTtlDays: 45,
+imageFetchTimeoutMs: 30_000,
 ```
 
 The Settings > Multimodal UI panel is out of scope for Phase 1 — power users can edit the config JSON directly. Phase 3 adds the UI.
@@ -715,8 +728,8 @@ Test cases (each 2-5 min to implement, TDD one at a time):
 25. Idempotency (within TTL): run twice on the same markdown → second run does no HTTP calls, no VLM calls, output identical.
 26. Data URI happy path: decoded, saved as local file, SHA-tracked, VLM-captioned when alt empty and above threshold. Malformed base64 → failed. Decoded > 20 MB → failed. Frontmatter entry is truncated to 64 chars + `…`.
 27. Failure isolation: one URL 404s, other 5 URLs still succeed.
-28. Title escape (generator side): VLM returns caption containing `"` → written markdown uses `\u201D` curly quote, not `\"`. Verify parser round-trips.
-29. Alt escape (generator side): VLM returns alt containing `]` → written markdown uses `\]`. Alt with newline → single space.
+28. Title sanitization (generator side, §7 title rule): VLM returns caption containing `"` → written markdown uses `\u201D` curly quote uniformly (not backslash-escape). Verify parser round-trips the whole `![...](...)` structure without breaking. Round-trip note: the original `"` glyph is intentionally not recoverable; the assertion is on the substitution, not on lossless preservation.
+29. Alt escape (generator side, §7 alt rule): VLM returns alt containing `]` → written markdown uses `\]` (backslash-escape, NOT sanitize-and-drop). Parser reverses to `]` on read (verify round-trip). Additional assertions in same test: alt with `\n` → single space; alt with U+200B (zero-width space) → stripped; alt with balanced `[foo]` citation-style → written as `\[foo\]` and round-trips back.
 30. **Codex-CLI provider** (§1 Provider capability gate) → I/O runs normally (download / copy / decode); VLM is skipped batch-wide via the upfront `canRunVlm` check, NOT via per-image throw. `captionImage` must never be invoked in this test. Assertions:
     - `stats.captioned === 0` (no VLM calls)
     - `stats.failed === 0` (skipping ≠ failure)
