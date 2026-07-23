@@ -1,6 +1,6 @@
 # Markdown image localizer
 
-**Status:** Spec v3.1 (revised 2026-07-23 after third review round — spec-vs-code alignment fixes: C1 export gaps, C2 codex-cli throw semantics, C3 `isMarkdown` binding, C4 cache-key composition). Branch: `feat/markdown-image-localizer`, cut from `main` at `e8bdec6` (upstream v0.6.5 tip).
+**Status:** Spec v3.2 (revised 2026-07-23 after third review round — v3.1 fixed 4 CRITICAL spec-vs-code drifts; v3.2 folds in 6 WORTH refinements: source-watch reenqueue semantics, `image_sources:` foreign-entry preservation, fixture arithmetic, probe DI, TOCTOU note, pre-Commit-5 seeding audit). Branch: `feat/markdown-image-localizer`, cut from `main` at `e8bdec6` (upstream v0.6.5 tip).
 
 **Predecessor:** `plans/multimodal-images.md` — landed the PDF/PPTX/DOCX image-extraction + VLM caption pipeline in v0.6.4. This plan extends the same pipeline to **markdown inputs**.
 
@@ -130,7 +130,7 @@ The v2 plan collapsed everything into a single "download + caption + rewrite" pi
 - **Empty alt + unknown dimensions** (SVG, HEIC, or decode failure) — treated as over threshold, run VLM. Better to spend a caption than skip a real chart.
 - **Non-empty alt** — threshold irrelevant; VLM never runs.
 
-**Phase 1 implementation:** dimension probing is done in TypeScript via `createImageBitmap` (available in Tauri webview). Cheap for PNG/JPEG/WebP/GIF, unreliable for SVG (returns bitmap-rasterized bounds — good enough). Phase 2 replaces this with a Rust command that adds the `image` crate's `jpeg,webp,gif` features. **Test note:** vitest runs under jsdom by default and `createImageBitmap` is undefined there — the localizer's probe function must be mockable, and Commit 3's first test verifies the mock path.
+**Phase 1 implementation:** dimension probing is done in TypeScript via `createImageBitmap` (available in Tauri webview). Cheap for PNG/JPEG/WebP/GIF, unreliable for SVG (returns bitmap-rasterized bounds — good enough). Phase 2 replaces this with a Rust command that adds the `image` crate's `jpeg,webp,gif` features. **Test injection:** the probe is a dependency injected through `LocalizeOptions.probeImageDimensions` (see §6). Production callers omit it and get the `createImageBitmap`-based default; vitest tests supply a stub (jsdom does not provide `createImageBitmap`). Phase 2's Rust command drops in through the same seam — no signature or call-site changes required.
 
 ### 3. Cross-document deduplication (two-tier cache)
 
@@ -213,6 +213,15 @@ All three must pass for `already-localized`. Otherwise fall through to `local-re
 
 For remote URLs, the URL cache within TTL does the equivalent job — a hit bypasses the network entirely.
 
+**TOCTOU note.** The three-step check (resolve → regex → exists) is intentionally not atomic with the subsequent read/copy operation. The race window is between step 3's `fileExists` returning `true` and the follow-up action. Two concrete race scenarios and how the localizer handles them:
+
+1. **File exists at check-time, gone by copy-time** (e.g. user deleted it, source-sync moved it): the `already-localized` branch does no I/O anyway — it just leaves the reference untouched — so it can't fail from this race. The `local-relative` branch's `copyFile` will fail; the failure is caught, the image counted as `failed`, and the batch continues. No partial-write corruption.
+2. **File missing at check-time, appears by copy-time** (e.g. temporary source-sync outage): the classifier decides `already-localized` no longer applies and falls through to `local-relative`. `copyFile` is idempotent by target path (`wiki/media/<slug>/<name>-<sha8>.<ext>` — the sha8 is deterministic for the same bytes), so if the file appearing to exist by copy-time contains the same bytes, `copyFile` overwrites the target with byte-identical content. If contents differ (unlikely — you'd have to change the source file between two 100ms-apart checks and end up with the same sha8), the target gets the new bytes; the alt-text-side identity via caption cache still keys on sha8 of the current bytes, so nothing goes out of sync.
+
+The `local-relative → copyFile` write path is therefore idempotent under concurrent access. The `already-localized → skip` path has no write at all so has no race. The only unrecoverable case is filesystem permission or space failures, which are already counted as `failed` in the stats.
+
+Deferred to Phase 2 if needed: an in-flight write-target lockset (per project) to serialize copyFile writes to the same target path — cheap to add once we see it matter in practice.
+
 **Second ingest within TTL:** I/O-free — hits every cache tier. Not literally a full no-op because the ingest activity still records the run and `saveIngestCache` still touches disk, but zero HTTP, zero VLM, zero image writes.
 
 ### 6. New file: `src/lib/markdown-image-localizer.ts`
@@ -229,6 +238,13 @@ export interface LocalizeOptions {
   multimodalConfig: MultimodalConfig
   signal?: AbortSignal
   onProgress?: (done: number, total: number, stage: 'download' | 'caption') => void
+  /** Optional override for image dimension probing. Injected primarily
+   *  for tests — vitest runs under jsdom where `createImageBitmap` is
+   *  undefined, so unit tests supply a stub that maps bytes → dims by
+   *  fixture keying. Production callers omit this and get the default
+   *  `createImageBitmap`-based implementation. Also the seam Phase 2's
+   *  Rust probe drops in through. */
+  probeImageDimensions?: (mimeType: string, bytes: Uint8Array) => Promise<{ width: number; height: number }>
 }
 
 export interface LocalizeResult {
@@ -280,7 +296,7 @@ Internals (private):
 - `classifyImageUrl(url, sourceDir, projectPath)` — one of `remote-http` / `data-uri` / `local-relative` / `already-localized` / `unsupported`. `already-localized` requires the three-step check from §5 (resolve → regex → exists), done against the resolved absolute path.
 - `readUrlCache(pp) / upsertUrlCacheEntry(pp, url, entry)` — per-entry upsert (see §3.2 concurrency note).
 - `sha8OfBytes(bytes)` — 8-char hex prefix of SHA-256.
-- `probeImageDimensions(mimeType, bytes)` — `createImageBitmap`-based, mockable for vitest. Returns `{ width: 0, height: 0 }` for SVG / decode failure (treated as "over threshold").
+- `probeImageDimensions(mimeType, bytes)` — private default implementation using `createImageBitmap`; returns `{ width: 0, height: 0 }` for SVG / decode failure (treated as "over threshold" per §2). Callers inside the module dispatch to `opts.probeImageDimensions ?? defaultProbeImageDimensions`, so tests can swap the whole probe via `LocalizeOptions` without needing module-level test hooks. See §6 `LocalizeOptions.probeImageDimensions`.
 - `slugFromChain(vlmAlt, vlmTitle, authorAlt, url)` — `safeSlug` chain; author alt inserted between VLM output and URL basename.
 - `rewriteBySlot(markdown, replacements, pathForm)` — replaces `![alt](url "title")` at each recorded offset, in reverse offset order to keep earlier offsets valid. `pathForm` selects `sourceRelPath` or `wikiRelPath` per replacement.
 - `mergeImageSourcesFrontmatter(rawBlock, mapping)` — see §11 for lifecycle rules; uses `parseFrontmatter` and preserves untouched keys.
@@ -466,9 +482,30 @@ For **repeat ingests within the URL cache TTL**, the localizer's Axis A cache sh
 - Adding a new fingerprint dimension in the future is a one-line change to `buildIngestHashInput` — the cache module signature is stable forever.
 - The `ingest-cache.test.ts` fingerprint tests target `buildIngestHashInput` directly (pure function → trivial assertions) without needing to mock a store.
 
-**Source-watch reenqueue:** the write in Step 0.4 will trigger source-watch. That's fine — the workingSourceContent propagation ensures the reenqueued ingest is an I/O-free cache hit. The activity panel will show an extra ingest entry per localized file on the first ingest after the feature ships; that's the visible price of a one-shot backfill and is acceptable. If we later want to hide it, add an in-flight self-write suppression set to `project-file-sync`; deferred to Phase 3.
+**Source-watch reenqueue:** the write in Step 0.4 will trigger source-watch. That's fine — the workingSourceContent propagation ensures the reenqueued ingest is an I/O-free cache hit. The activity panel will show an extra ingest entry **every time a new image reference is added to an already-ingested markdown file** (not just once after the feature ships). Concretely:
 
-**Wiki-page seeding:** `result.rewrittenWikiMarkdown` is used downstream when we write to `wiki/sources/<slug>.md`. The current flow feeds `sourceContent` (or its processed variant) into the LLM generation prompt; that prompt needs to see the wiki-form of image references so the LLM preserves them in its output. Commit 5 audits the exact seeding point (candidate: `ingest.ts:~1000` where the generation prompt is assembled) and switches its input to `workingWikiSourceContent = result.rewrittenWikiMarkdown` when localization ran.
+- **First-ever ingest** of a markdown with any image → 1 real ingest + 1 cache-hit reenqueue = 2 activity rows.
+- **Re-ingest after author edits body text only** (no new image URLs) → 1 real ingest, no reenqueue (localizer produces identical output, Step 0.4's `writeFile` branch is skipped because `rewrittenSourceMarkdown === sourceContent`).
+- **Re-ingest after author adds a new image URL** → 1 real ingest + 1 cache-hit reenqueue = 2 activity rows.
+- **Re-ingest after author only changes surrounding prose but URLs unchanged** → 1 real ingest, no reenqueue.
+
+For a user with source-watch auto-import on and an actively-edited markdown file, this is one extra activity row **per editing session that adds an image**, not one-time. The reenqueued row completes in milliseconds (cache hit) but visually occupies a row until the panel scrolls it off.
+
+If UX testing before v0.6.6 GA shows this is disruptive, add an in-flight self-write suppression set to `project-file-sync` — the pattern is: mark the path as "just written by us", suppress the next source-watch fire for that path within a short window. This is scoped as Phase 3 in §12 but should be **re-evaluated based on user testing feedback** rather than deferred unconditionally.
+
+**Wiki-page seeding:** `result.rewrittenWikiMarkdown` is used downstream when we write to `wiki/sources/<slug>.md`. The current flow feeds `sourceContent` (or its processed variant) into the LLM generation prompt; that prompt needs to see the wiki-form of image references so the LLM preserves them in its output.
+
+**Pre-Commit-5 audit (Commit 4 tail).** The exact seeding site is not yet pinned down — `sourceContent` is read at multiple points in `ingest.ts` for prompt/embedding assembly (candidates: `ingest.ts:1948`, `2012`, `2171`, `2506`, `2571`, `2949` at v3 spec time). Before Commit 5 starts, run this spike:
+
+1. With Commit 4's localizer merged, use the fixture from §Testing "Integration (manual smoke)" — a markdown with Cell 1 (remote URL, VLM-captioned).
+2. Add temporary `console.log`s at each of the six candidate call sites showing whether the local variable in scope contains the localized form (`../../wiki/media/...`) or the original remote URL (`https://...`).
+3. Ingest once end-to-end (localizer disabled) → confirm all six sites see the original content.
+4. Ingest again (localizer enabled) → the sites that need `rewrittenWikiMarkdown` are the ones that end up writing to `wiki/sources/<slug>.md` OR feeding an embedding index whose consumers expect wiki-form paths.
+5. Record the site list in the Commit 5 preamble. The Commit 5 diff at each site swaps `sourceContent` → `workingWikiSourceContent = result.rewrittenWikiMarkdown ?? workingSourceContent` (fallback for the non-localized branch).
+
+Acceptance criteria for the audit: every `sourceContent` read post-Step-0.4 is classified as either **"wiki-form target"** (needs `rewrittenWikiMarkdown`) or **"raw-form target"** (needs `workingSourceContent`). No unclassified sites. Sign-off is the diff comment on the Commit 5 PR: "audited N sites, K → wiki-form, N-K → raw-form".
+
+This audit is scoped as Commit 4 tail rather than deferred into Commit 5 because if it turns out an unexpected call site needs wiki-form, Commit 5's diff grows. Doing the classification before Commit 5 opens the file makes the commit small and reviewable.
 
 Downstream implications:
 - `markdownLocalizedImages` is concatenated with the existing `savedImages` list at Step 5 so `injectImagesIntoSourceSummary` sees every image.
@@ -549,13 +586,21 @@ image_sources:
 **Lifecycle rules** (v3, addresses value-1 review finding):
 
 1. **Populate** at end of each successful Step 0.4 run:
-   - Compute the target mapping = union of (this-run's `remote-http` and `data-uri` entries) ∪ (already-existing entries in frontmatter whose local path is still referenced somewhere in the body).
-   - Emit that mapping into frontmatter, replacing any previous `image_sources:` block. This is a **full-rewrite semantics**, not "append/merge without pruning".
+   - Compute the target mapping = union of (this-run's `remote-http` and `data-uri` entries) ∪ (already-existing entries **owned by the localizer** whose local path is still referenced somewhere in the body).
+   - Emit that mapping into frontmatter, replacing the previous set of localizer-owned entries. Entries not owned by the localizer (see rule 5) are preserved verbatim.
 2. **User manually deletes an image reference in body** — next re-ingest sees that local path is no longer referenced; the entry drops from the mapping.
 3. **User replaces a remote URL with another remote URL, same SHA** — new entry with the new URL is added; old entry is dropped (because its local path is no longer referenced — the local path changes when SHA changes; here we hypothesized no SHA change, but URL changed anyway, so the previous URL's local path IS the same local path, and it stays with the newer URL as value).
 4. **User toggles `localizeMarkdownImages: true → false → true`** — the false step doesn't run Step 0.4, so nothing touches frontmatter. On re-enable, next ingest rewrites according to rule 1.
-5. **User authors their own `image_sources:` key for another purpose** — collision. Merge helper **loses the user's data** if it uses the same key name. Documented behavior: the key `image_sources:` is owned by the localizer; if users have another use for it, they must rename theirs. UI panel in Phase 3 will surface this in help text.
-6. **Merge implementation:** use `parseFrontmatter` to get `{ frontmatter, body, rawBlock }`. Compute the new `image_sources:` object. Serialize the merged frontmatter (preserving the values of all OTHER keys verbatim from `frontmatter`, but replacing/removing `image_sources:` per rule 1) via a targeted YAML edit — do NOT dump the whole object via `yaml.dump()` because that reformats every key. Simplest implementation: locate the `image_sources:` block in `rawBlock` by regex, replace or delete it in place; if it doesn't exist, prepend it before the closing `---`. Round-trips other keys with zero drift.
+5. **Ownership discipline — the localizer only manages entries whose key starts with `wiki/media/`.** This is the fixed prefix where localized files land (see §4). Ownership rules:
+   - **Localizer-owned entry:** key matches the pattern `wiki/media/<slug>/<name>-[0-9a-f]{8}.<ext>`. The localizer freely adds, updates, or removes these on each Step 0.4 run per rule 1.
+   - **Foreign entry:** key does NOT match that pattern (e.g. `assets/user-drawing.png`, or a user's manually-written entry like `custom-images/logo.svg`). The localizer preserves these entries **verbatim** across every rewrite — the merge helper reads the existing block, identifies foreign entries by prefix mismatch, and re-emits them alongside the localizer-owned block.
+   - **User collision on a localizer-owned key:** if a user manually writes an entry under `wiki/media/...` for their own purpose, the localizer WILL overwrite it on the next Step 0.4 run. Documented behavior — the `wiki/media/` prefix is reserved for llm-wiki-managed image origins.
+   - **Cross-subsystem coordination:** if a future llm-wiki subsystem (e.g. mineru URL provenance) also wants to write to `image_sources:`, it must use its own prefix (e.g. `wiki/media/<slug>/mineru/...`), and its keys will NOT collide with the localizer's `wiki/media/<slug>/<name>-<sha8>.<ext>` shape. The `-<sha8>.<ext>` suffix on the localizer's keys is a discriminator.
+6. **Merge implementation:** use `parseFrontmatter` to get `{ frontmatter, body, rawBlock }`. Parse the existing `image_sources:` block (if present) into two buckets by key prefix:
+   - `ownedByLocalizer[k] = v` for keys matching `^wiki/media/[^/]+/[^/]+-[0-9a-f]{8}\.[a-z0-9]+$`
+   - `foreign[k] = v` for the rest
+   
+   Compute the new localizer mapping from the current run (per rule 1). Emit the merged block as: `foreign` entries in their original order, followed by the current localizer mapping. Serialize via a targeted YAML edit — do NOT dump the whole frontmatter object via `yaml.dump()` because that reformats every key. Simplest implementation: locate the `image_sources:` block in `rawBlock` by regex, replace it in place with the merged serialization; if it doesn't exist, prepend `image_sources:` + block before the closing `---`. Round-trips other frontmatter keys with zero drift.
 
 The mapping is one-way (`local → original`). Purpose:
 - Traceability: users who want to know "where did this image come from" have a machine-readable record.
@@ -573,7 +618,7 @@ The mapping is one-way (`local → original`). Purpose:
 **Phase 3** (UX / operational polish):
 
 - Settings > Multimodal panel row: toggle + threshold slider + TTL input
-- Source-watch self-write suppression to hide the redundant reenqueue in activity panel
+- **Source-watch self-write suppression** to hide the redundant reenqueue in activity panel — priority depends on UX testing (see §8 "Source-watch reenqueue"). If pre-GA testing shows one extra row per editing-session-with-new-image is disruptive, this promotes to a Phase 1 blocker.
 - Activity feed granular states: `Downloading 3/12`, `Captioning 3/12`, per-image error surfacing
 
 ---
@@ -608,7 +653,7 @@ Mock:
 - `getHttpFetch` → a hand-written fetch stub with per-URL response fixtures (headers + body)
 - `captionImage` → deterministic stub returning `{ caption: 'CAP_' + hash8, title: 'T_' + hash8 }`
 - `writeFileBase64`, `writeFile`, `readFile`, `copyFile`, `createDirectory`, `fileExists` → in-memory VFS
-- `createImageBitmap` → mockable probe helper (see §2 test note)
+- `probeImageDimensions` → **NOT mocked at module level**; instead each test that cares about dimensions passes an `opts.probeImageDimensions` stub through `LocalizeOptions` (see §6). Default probe (`createImageBitmap`) is jsdom-incompatible; tests that don't care about the threshold gate can pass a constant `() => Promise.resolve({ width: 999, height: 999 })` to force "over threshold".
 
 Test cases (each 2-5 min to implement, TDD one at a time):
 
@@ -646,7 +691,7 @@ Test cases (each 2-5 min to implement, TDD one at a time):
 
 11. Frontmatter `image_sources:` populated with 2 remote URLs + 1 truncated data URI; local-relative image gets no entry; existing untouched YAML keys preserved verbatim (whitespace, comments, ordering).
 12. Re-ingest where 1 of the 2 remote images was manually deleted from body → `image_sources:` drops that entry.
-13. User authored their own `image_sources:` key → merged blob overwrites it. Emits a warning to console (documented behavior).
+13. **Frontmatter foreign-entry preservation:** user pre-authored `image_sources:` with a non-`wiki/media/` key (e.g. `assets/user-note.png: "https://user-source.example/x.png"`) → after Step 0.4 runs, the foreign entry is preserved verbatim, localizer's own entries appear alongside. Test also asserts: if the user pre-wrote a key UNDER `wiki/media/` (colliding with the reserved prefix), it IS overwritten and a warning is emitted to console.
 
 **Group D — caching (Commit 3):**
 
@@ -716,36 +761,40 @@ Create a fixture markdown file in a scratch project. **The fixture must exercise
 <!-- Threshold: empty alt + tiny image — download but no VLM -->
 Small icon: ![](https://placehold.co/16x16.png)
 
-<!-- Data URI: empty alt + inline base64 (create a tiny valid PNG) -->
+<!-- Data URI: empty alt + inline 1x1 PNG — below threshold, VLM skipped -->
 ![](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==)
 ```
 
-Prepare `./local-diagram.png` and `./architecture.svg` in the source directory before ingest.
+Prepare `./local-diagram.png` (≥100×100) and `./architecture.svg` (SVG treated as "over threshold" per §2 — unknown dimensions default to VLM-eligible) in the source directory before ingest.
 
 Ingest via the UI. Verify by inspecting `raw/sources/<slug>.md`:
 
-- `image_sources:` frontmatter has **entries only for remote URLs and data URIs** (Cells 1 & 2 remote entries + truncated data-URI entry). Local-relative entries (Cells 3 & 4) do NOT appear in the mapping (per §11 v3 lifecycle).
+- `image_sources:` frontmatter has **4 entries** — one per remote URL (Cell 1, Cell 2, small icon) plus one truncated entry for the data URI. Local-relative entries (Cells 3 & 4) do NOT appear (per §11 v3 lifecycle).
 - Body has 6 image references, all `../../wiki/media/<slug>/... "..."` form:
   - Cell 1 alt is VLM-generated text like "The Rust programming language logo — a stylized R"
   - Cell 2 alt is **byte-identical to author's input**: "The Ferris mascot — an orange crab..." — and title is "Ferris in profile"
   - Cell 3 alt is VLM-generated
   - Cell 4 alt is **byte-identical to author's input**: "System architecture: three-tier..."
-  - Small icon has empty alt `![]` still (VLM skipped, threshold), URL rewritten to local
-  - Data URI has VLM-generated alt (assuming above threshold)
+  - Small icon has empty alt `![]` still (VLM skipped, 16×16 < 100 threshold), URL rewritten to local
+  - Data URI has empty alt `![]` still (VLM skipped, 1×1 < 100 threshold), URL rewritten to local
 - `wiki/media/<slug>/` contains **6 files** with `-<sha8>.<ext>` suffixes
 - `wiki/sources/<slug>.md` has the same body with `../media/<slug>/...` (single-`../`) relative paths
-- `.llm-wiki/image-url-cache.json` has **3 entries** (Cells 1 & 2 remotes + the small placeholder; local files don't cache-URL)
-- `.llm-wiki/image-caption-cache.json` has **4 entries** — VLM ran for: Cell 1, Cell 3, data URI. Cell 2, Cell 4 skipped due to author alt; small icon skipped due to threshold. So actually **3 entries**. (Adjust based on which cells hit the VLM.)
+- `.llm-wiki/image-url-cache.json` has **3 entries** — one per remote URL (Cell 1, Cell 2, small icon). Local files and data URIs are not URL-cached.
+- `.llm-wiki/image-caption-cache.json` has **2 entries** — VLM ran for Cell 1 and Cell 3 (both empty-alt, above threshold). Cell 2, Cell 4 skipped because author wrote alt. Small icon and data URI skipped because both are below the 100px threshold.
 - `stats` returned by the localizer:
   - `downloaded: 3` (Cells 1, 2, small icon — Cell 2 downloads even though VLM skips)
   - `copied: 2` (Cells 3, 4)
   - `decoded: 1` (data URI)
   - `alreadyLocalized: 0` (first ingest)
-  - `captioned: 3` (Cell 1, Cell 3, data URI)
+  - `captioned: 2` (Cell 1, Cell 3)
   - `skippedAuthorAlt: 2` (Cells 2, 4)
-  - `skippedTooSmall: 1` (small icon)
+  - `skippedTooSmall: 2` (small icon, data URI)
+  - `skippedNoVlmProvider: 0` (VLM-capable provider assumed for this fixture)
+  - `failed: 0`
 - Activity panel likely shows two ingest entries: first is the real run, second is the source-watch reenqueue which cache-hits and completes in milliseconds
 - Third ingest (via re-import) — one entry, cache hit, no network, no VLM, no writes
+
+**Alternate fixture (if you want to exercise the data-URI VLM path):** replace the 1×1 PNG data URI with a ≥100×100 encoded image. Adjust the caption cache count to **3** and `captioned` to **3**, `skippedTooSmall` to **1** (small icon only).
 
 ### Regression
 
@@ -764,10 +813,10 @@ Ingest via the UI. Verify by inspecting `raw/sources/<slug>.md`:
 | 1 | `MultimodalConfig` schema + defaults (add `localizeMarkdownImages`, `minImagePixelSize`, `urlCacheTtlDays`, `imageFetchTimeoutMs`); cache-key parameter rename (`sourceContent` → `hashInput`) + new `buildIngestHashInput` helper in ingest.ts; **expose reused defenses**: add `export` to `validateHttpUrl`, `isPrivateNetworkHost`, `safeSlug` in `url-source-import.ts` and to `isInsideProject` in `markdown-image-resolver.ts` | `src/stores/wiki-store.ts`, `src/lib/ingest-cache.ts`, `src/lib/ingest.ts`, `src/lib/url-source-import.ts`, `src/lib/markdown-image-resolver.ts` + extended test | typecheck; `ingest-cache.test.ts` incl. new fingerprint cases; `import { validateHttpUrl } from "@/lib/url-source-import"` compiles from a scratch test file |
 | 2 | `CaptionEntry` optional fields (title, originalUrl), forward-compat | `src/lib/image-caption-pipeline.ts` | existing 21 caption tests stay green |
 | 3 | Localizer module — **core plumbing** (URL classification with 3-step already-localized check, URL cache w/ per-entry upsert, HTTP download with SSRF + Content-Length + timeout defense, copyFile local path, data URI decode w/ truncation, SHA-256 dedup, `resolveLocalRelative` w/ `isInsideProject`, NO VLM yet) | `src/lib/markdown-image-localizer.ts`, first half of `markdown-image-localizer.test.ts` (Groups A, D, E — tests 1-2, 14-23) | new module tests |
-| 4 | Localizer — **decision matrix + VLM + rewrite + frontmatter** (§1 axis-B gating, `captionImage` integration with codex-cli fallback, both `rewrittenSourceMarkdown` and `rewrittenWikiMarkdown` outputs via §7 regex + §4 path helper, `parseFrontmatter` merge with §11 lifecycle rules, generator-side escape) | rest of `markdown-image-localizer.ts` + rest of `.test.ts` (Groups B, C, F + integration tests — tests 3-13, 24-34) | all new module tests |
+| 4 | Localizer — **decision matrix + VLM + rewrite + frontmatter** (§1 axis-B gating + provider capability gate, `captionImage` integration, both `rewrittenSourceMarkdown` and `rewrittenWikiMarkdown` outputs via §7 regex + §4 path helper, `parseFrontmatter` merge with §11 lifecycle rules incl. foreign-entry preservation, generator-side escape). **Tail: run wiki-page seeding audit per §8 "Pre-Commit-5 audit" and record the classified site list.** | rest of `markdown-image-localizer.ts` + rest of `.test.ts` (Groups B, C, F + integration tests — tests 3-13, 24-34) | all new module tests; seeding-audit site list attached to Commit 4 PR |
 | 5 | `autoIngestImpl` integration (Step 0.4 hook + `workingSourceContent` propagation across 5 call sites; skip `extractAndSaveMarkdownImages` when localizer enabled; wire `rewrittenWikiMarkdown` into wiki-page seeding) | `src/lib/ingest.ts` | full `npm run test` + smoke ingest per fixture above |
 
-Commit 1 covers the cache-fingerprint change because it's a self-contained, low-risk 2-line diff that Commit 5's integration depends on. Doing it upfront lets Commit 5 focus purely on the ingest hook.
+Commit 1 covers the cache-key composition change (parameter-rename in `ingest-cache.ts` + new `buildIngestHashInput` helper) because it's a self-contained change that Commit 5's integration depends on. Doing it upfront lets Commit 5 focus purely on the ingest hook without also refactoring cache semantics.
 
 Each commit is independently mergeable and reversible. Commits 3-4 split the localizer at a natural seam (network/FS I/O vs policy/VLM) so a bisect on Commit 4 doesn't pull in Commit 3's changes.
 
@@ -777,7 +826,7 @@ Each commit is independently mergeable and reversible. Commits 3-4 split the loc
 
 | # | Risk | Severity | Mitigation |
 |---|---|---|---|
-| 1 | Source-watch reenqueue after localizer writes — activity panel shows a redundant entry | LOW | `workingSourceContent` propagation makes the reenqueued ingest an I/O-free cache hit. UX polish deferred to Phase 3. |
+| 1 | Source-watch reenqueue after localizer writes — activity panel shows a redundant entry **every editing session that adds a new image URL**, not just once | LOW-MED | `workingSourceContent` propagation makes the reenqueued ingest an I/O-free cache hit. Re-evaluate suppression priority based on UX testing before v0.6.6 GA (may need to move from Phase 3 to Phase 1). |
 | 2 | Remote server serves different content on re-fetch (SHA change) | LOW-MED | 45-day TTL naturally revalidates; SHA-change path creates a new file with new suffix, no silent overwrite |
 | 3 | Very large image (10 MB PNG) → base64 IPC round-trip cost | LOW | 20 MB body cap catches abuse; typical hero image is <500 KB |
 | 4 | VLM cost for a giant markdown corpus | MED | SHA cache eliminates duplicates; **author-alt-non-empty skip** eliminates already-accessible images; user can flip `localizeMarkdownImages = false` for large batch imports; Phase 2 resize cuts per-caption cost |
@@ -785,7 +834,7 @@ Each commit is independently mergeable and reversible. Commits 3-4 split the loc
 | 6 | User disables the feature after using it — localized files stay in `wiki/media/` and body still references them | LOW | Same as PDF-extracted images today. `cascadeDeleteWikiPage` reaps on source deletion. No proactive cleanup — flipping the toggle off doesn't revert the raw-sources copy. Documented behavior. |
 | 7 | Concurrency thundering herd on a slow origin | LOW | Download pool capped at `min(4, mmCfg.concurrency)` |
 | 8 | Data URI in markdown expands to >20MB after base64 decode | LOW | `resolveDataUri` rejects; failure counted, other images continue |
-| 9 | Frontmatter merge collides with a user-authored `image_sources` key | LOW | Localizer owns the key; user must rename. Documented per §11 rule 5. |
+| 9 | Frontmatter merge collides with a user-authored `image_sources` key | LOW | Localizer only manages entries under the reserved `wiki/media/` prefix; foreign entries (non-`wiki/media/` keys) are preserved verbatim across rewrites. Cross-subsystem contract documented per §11 rules 5–6. |
 | 10 | User's authored alt is a placeholder like `"image"` or `"figure 3"` — v3 spec preserves it verbatim, missing an accessibility improvement opportunity | LOW-MED | Documented per §1 Rationale #1 ("VLM is a gap-filler, not a rewriter"). Users who want VLM to run must leave alt empty. Phase 3 UI could offer a "re-caption anyway" button per image. |
 | 11 | Two `LocalizeResult` outputs — implementation forgets to feed `rewrittenWikiMarkdown` to the wiki-page seeder and wiki page ends up with wrong-form paths | MED | Commit 5 explicit audit step; integration test #31-32 verifies both forms; TypeScript catches missing field access if the seeder function requires it |
 | 12 | `workingSourceContent` propagation missed at one of 5 call sites — cache thrashes on cold start | MED | Commit 5 checklist has all 5 sites; grep-audit step in the commit plan; test-level: cache-fingerprint test detects the specific loop-close bug |
