@@ -1,10 +1,10 @@
 ---
 kind: task
-last_updated: '2026-07-23T02:30:00+00:00'
-last_writer: design-review
+last_updated: '2026-07-23T02:20:18+00:00'
+last_writer: hand-off
 last_agent: hermes-agent
 session_id: session-2026-07-23-mdimg-review
-last_verified: '2026-07-23T02:30:00+00:00'
+last_verified: '2026-07-23T02:20:18+00:00'
 ---
 
 # Task — markdown image localizer (Phase 1)

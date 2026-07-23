@@ -1,11 +1,11 @@
 ---
 kind: questions
 version: 1
-last_updated: '2026-07-23T01:47:08+00:00'
-last_verified: 2026-07-23 01:40:22+00:00
+last_updated: '2026-07-23T02:20:28+00:00'
+last_verified: '2026-07-23T02:20:19+00:00'
 last_agent: hermes-agent
 last_writer: hand-off
-session_id: session-2026-07-23-mdimg
+session_id: session-2026-07-23-mdimg-review
 status: in-progress
 ---
 
@@ -24,6 +24,8 @@ status: in-progress
 > Auto-generated SOFT-conflict warnings from `check-reality --apply-soft-conflicts` are appended under `## Open` as timestamped entries — resolve them by adding `<!-- resolved -->` once addressed.
 
 ## Open
+
+- None.
 
 - None.
 
