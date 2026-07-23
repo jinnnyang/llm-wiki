@@ -394,6 +394,13 @@ export function SettingsView() {
       // going wider than ~16 just queues behind the server's batch
       // slot.
       concurrency: Math.max(1, Math.min(16, draft.multimodalConcurrency || 4)),
+      // Phase 1 of the markdown-image localizer (v0.6.6) doesn't wire
+      // these fields into the Settings UI — pass through the current
+      // store values so the required interface is satisfied.
+      localizeMarkdownImages: multimodalConfig.localizeMarkdownImages,
+      minImagePixelSize: multimodalConfig.minImagePixelSize,
+      urlCacheTtlDays: multimodalConfig.urlCacheTtlDays,
+      imageFetchTimeoutMs: multimodalConfig.imageFetchTimeoutMs,
     }
 
     const newProxy = {

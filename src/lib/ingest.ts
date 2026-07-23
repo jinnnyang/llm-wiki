@@ -637,6 +637,29 @@ async function appendIngestWarningLog(
   }
 }
 
+/**
+ * Compose the string that gets SHA-256'd for the ingest cache key.
+ *
+ * v0.6.6 folds behavior-affecting config flags into the hashed material
+ * so toggling them invalidates the cache without a signature change on
+ * `checkIngestCache` / `saveIngestCache`. See `ingest-cache.ts` JSDoc.
+ *
+ * Currently folded in: `localizeMarkdownImages` (the markdown image
+ * localizer's master toggle). `minImagePixelSize` and `urlCacheTtlDays`
+ * are deliberately NOT folded in — they change per-image internal
+ * behavior, not output shape, and shouldn't force full re-ingest.
+ *
+ * To add a future fingerprint dimension, extend the format string here
+ * — no changes to `ingest-cache.ts` needed.
+ */
+export function buildIngestHashInput(
+  content: string,
+  mmCfg: MultimodalConfig,
+): string {
+  const localize = mmCfg.enabled && mmCfg.localizeMarkdownImages ? "1" : "0"
+  return `${content}\n\n---cache-fingerprint---\nlocalize=${localize}\n`
+}
+
 async function autoIngestImpl(
   projectPath: string,
   sourcePath: string,
