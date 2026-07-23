@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest"
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest"
 
 // Mock fs so the tests don't touch real disk. Follows the same pattern
 // as `ingest-cache.test.ts` — the plan's §6 keeps DI narrow to
@@ -8,6 +8,9 @@ vi.mock("@/commands/fs", () => ({
   readFile: vi.fn(),
   writeFile: vi.fn(),
   createDirectory: vi.fn(),
+  writeFileBase64: vi.fn(),
+  copyFile: vi.fn(),
+  readFileAsBase64: vi.fn(),
 }))
 
 import {
@@ -21,22 +24,44 @@ import {
   upsertUrlCacheEntry,
   isUrlCacheEntryFresh,
   sha8OfBytes,
+  fetchRemoteImage,
+  resolveDataUri,
+  truncateDataUriForFrontmatter,
+  localizeMarkdownImages,
+  MAX_IMAGE_BYTES,
   type UrlCacheEntry,
+  type LocalizeOptions,
 } from "./markdown-image-localizer"
-import { fileExists, readFile, writeFile, createDirectory } from "@/commands/fs"
+import {
+  fileExists,
+  readFile,
+  writeFile,
+  createDirectory,
+  writeFileBase64,
+  copyFile,
+  readFileAsBase64,
+} from "@/commands/fs"
 
 const mockFileExists = vi.mocked(fileExists)
 const mockReadFile = vi.mocked(readFile)
 const mockWriteFile = vi.mocked(writeFile)
 const mockCreateDirectory = vi.mocked(createDirectory)
+const mockWriteFileBase64 = vi.mocked(writeFileBase64)
+const mockCopyFile = vi.mocked(copyFile)
+const mockReadFileAsBase64 = vi.mocked(readFileAsBase64)
 
 beforeEach(() => {
   mockFileExists.mockReset()
   mockReadFile.mockReset()
   mockWriteFile.mockReset()
   mockCreateDirectory.mockReset()
+  mockWriteFileBase64.mockReset()
+  mockCopyFile.mockReset()
+  mockReadFileAsBase64.mockReset()
   mockWriteFile.mockResolvedValue(undefined as unknown as void)
   mockCreateDirectory.mockResolvedValue(undefined as unknown as void)
+  mockWriteFileBase64.mockResolvedValue(undefined as unknown as void)
+  mockCopyFile.mockResolvedValue(undefined as unknown as void)
 })
 
 // ---------------------------------------------------------------------------
@@ -544,5 +569,544 @@ describe("sha8OfBytes — 8-char lowercase hex prefix", () => {
     const a = await sha8OfBytes(new Uint8Array([0]))
     const b = await sha8OfBytes(new Uint8Array([1]))
     expect(a).not.toBe(b)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// resolveDataUri + truncateDataUriForFrontmatter (Commit 3c)
+// ---------------------------------------------------------------------------
+
+/** Base64 for a 1×1 red PNG — used as a valid image payload across tests. */
+const RED_1x1_PNG_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+
+describe("resolveDataUri — image data URI decoder (§10 rule 7)", () => {
+  it("decodes a valid base64 image/png data URI", () => {
+    const { bytes, mimeType } = resolveDataUri(
+      `data:image/png;base64,${RED_1x1_PNG_B64}`,
+    )
+    expect(mimeType).toBe("image/png")
+    expect(bytes.byteLength).toBeGreaterThan(0)
+    // PNG magic bytes: 89 50 4E 47
+    expect(bytes[0]).toBe(0x89)
+    expect(bytes[1]).toBe(0x50)
+  })
+
+  it("accepts charset= parameter alongside base64", () => {
+    const { mimeType } = resolveDataUri(
+      `data:image/png;charset=utf-8;base64,${RED_1x1_PNG_B64}`,
+    )
+    expect(mimeType).toBe("image/png")
+  })
+
+  it("rejects non-image MIME types", () => {
+    expect(() =>
+      resolveDataUri("data:text/plain;base64,SGVsbG8="),
+    ).toThrow(/Non-image/)
+  })
+
+  it("rejects non-base64 data URIs (Phase 1 non-goal)", () => {
+    expect(() =>
+      resolveDataUri("data:image/svg+xml,<svg></svg>"),
+    ).toThrow(/not base64/i)
+  })
+
+  it("rejects malformed data URIs entirely", () => {
+    expect(() => resolveDataUri("not a data uri")).toThrow(/Malformed/)
+  })
+
+  it("rejects decoded payloads that exceed 20 MB", () => {
+    // Build 21 MB of zero bytes → base64 (~28 MB string).
+    const bigBytes = new Uint8Array(21 * 1024 * 1024)
+    let binary = ""
+    const chunkSize = 0x8000
+    for (let i = 0; i < bigBytes.length; i += chunkSize) {
+      binary += String.fromCharCode(
+        ...bigBytes.subarray(i, i + chunkSize),
+      )
+    }
+    const b64 = btoa(binary)
+    expect(() => resolveDataUri(`data:image/png;base64,${b64}`)).toThrow(
+      /decoded size exceeds/,
+    )
+  })
+})
+
+describe("truncateDataUriForFrontmatter — 64-char cap (§11 table)", () => {
+  it("returns short data URIs unchanged", () => {
+    const short = "data:image/png;base64,iVBORw0KGgo="
+    expect(truncateDataUriForFrontmatter(short)).toBe(short)
+  })
+
+  it("truncates a long data URI to 64 chars + '…'", () => {
+    const long = "data:image/png;base64," + "A".repeat(200)
+    const out = truncateDataUriForFrontmatter(long)
+    expect(out.length).toBe(65) // 64 + one ellipsis char
+    expect(out.endsWith("…")).toBe(true)
+    expect(out.startsWith("data:image/png;base64,")).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Group E — network defense (Commit 3c; §10)
+// ---------------------------------------------------------------------------
+
+/** Build a minimal `Response`-like object for a raw byte body. */
+function makeResponse(
+  bytes: Uint8Array,
+  init: {
+    status?: number
+    contentType?: string
+    contentLength?: string | null
+    url?: string
+  } = {},
+): Response {
+  const headers = new Headers()
+  if (init.contentType !== null) {
+    headers.set("content-type", init.contentType ?? "image/png")
+  }
+  if (init.contentLength !== null) {
+    if (init.contentLength !== undefined) {
+      headers.set("content-length", init.contentLength)
+    }
+  }
+  const r = new Response(bytes as unknown as BodyInit, {
+    status: init.status ?? 200,
+    headers,
+  })
+  return r
+}
+
+describe("fetchRemoteImage — §10 defenses (Group E, tests 18-23)", () => {
+  it("test 18 — SSRF: private-network host rejected before any fetch", async () => {
+    const spy = vi.fn()
+    await expect(
+      fetchRemoteImage("http://192.168.1.1/x.png", 5_000, spy as unknown as typeof fetch),
+    ).rejects.toThrow(/private|local/i)
+    expect(spy).not.toHaveBeenCalled()
+  })
+
+  it("test 19 — redirect from public to private host rejected", async () => {
+    // First call: 302 with Location pointing to a private host.
+    // fetchImportUrl catches the cross-boundary redirect and throws.
+    const spy = vi.fn(async (url: string) => {
+      if (url.startsWith("https://public.example/")) {
+        return new Response(null, {
+          status: 302,
+          headers: { location: "http://10.0.0.1/x.png" },
+        })
+      }
+      return new Response("nope", { status: 500 })
+    })
+    await expect(
+      fetchRemoteImage(
+        "https://public.example/x.png",
+        5_000,
+        spy as unknown as typeof fetch,
+      ),
+    ).rejects.toThrow(/private|local/i)
+  })
+
+  it("test 20 — Content-Length > 20 MB rejected before body read", async () => {
+    const spy = vi.fn(async () =>
+      makeResponse(new Uint8Array(0), {
+        contentType: "image/png",
+        contentLength: String(500_000_000),
+      }),
+    )
+    await expect(
+      fetchRemoteImage(
+        "https://example.com/big.png",
+        5_000,
+        spy as unknown as typeof fetch,
+      ),
+    ).rejects.toThrow(/exceeds/)
+    // spy WAS called — HTTP request went out — but body was never read.
+    expect(spy).toHaveBeenCalledTimes(1)
+  })
+
+  it("test 21 — streaming body cap catches missing/lying Content-Length", async () => {
+    // Response with NO content-length, but body > 20 MB. The stream
+    // must abort before we buffer the whole thing.
+    const oversized = new Uint8Array(MAX_IMAGE_BYTES + 1024)
+    const spy = vi.fn(async () =>
+      makeResponse(oversized, {
+        contentType: "image/png",
+        contentLength: null,
+      }),
+    )
+    await expect(
+      fetchRemoteImage(
+        "https://example.com/mystery.png",
+        5_000,
+        spy as unknown as typeof fetch,
+      ),
+    ).rejects.toThrow(/exceeds/)
+  })
+
+  it("test 22 — Content-Type text/html rejected", async () => {
+    const spy = vi.fn(async () =>
+      makeResponse(new TextEncoder().encode("<html>"), {
+        contentType: "text/html",
+      }),
+    )
+    await expect(
+      fetchRemoteImage(
+        "https://example.com/not-really.png",
+        5_000,
+        spy as unknown as typeof fetch,
+      ),
+    ).rejects.toThrow(/non-image/i)
+  })
+
+  it("test 23 — timeout aborts the fetch (30s default; 50ms in test)", async () => {
+    // Never-resolving fetch; timeout=50ms should abort it.
+    const spy = vi.fn(
+      (_url: string, init: RequestInit) =>
+        new Promise<Response>((_, reject) => {
+          init.signal?.addEventListener("abort", () => {
+            reject(new DOMException("aborted", "AbortError"))
+          })
+        }),
+    )
+    await expect(
+      fetchRemoteImage(
+        "https://example.com/slow.png",
+        50,
+        spy as unknown as typeof fetch,
+      ),
+    ).rejects.toThrow()
+  })
+
+  it("happy path — small image/png body returned as bytes + mime", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const spy = vi.fn(async () =>
+      makeResponse(png, { contentType: "image/png" }),
+    )
+    const out = await fetchRemoteImage(
+      "https://example.com/tiny.png",
+      5_000,
+      spy as unknown as typeof fetch,
+    )
+    expect(out.mimeType).toBe("image/png")
+    expect(out.bytes.byteLength).toBe(png.byteLength)
+    expect(out.bytes[0]).toBe(0x89)
+  })
+
+  it("rejects URLs with embedded credentials before any fetch", async () => {
+    const spy = vi.fn()
+    await expect(
+      fetchRemoteImage(
+        "https://user:pass@example.com/x.png",
+        5_000,
+        spy as unknown as typeof fetch,
+      ),
+    ).rejects.toThrow(/credentials/i)
+    expect(spy).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Group D — caching (Commit 3c; tests 14-17)
+// ---------------------------------------------------------------------------
+
+/** Base options for `localizeMarkdownImages` integration tests. */
+function makeOpts(overrides: Partial<LocalizeOptions> = {}): LocalizeOptions {
+  return {
+    projectPath: "/project",
+    sourcePath: "/project/raw/sources/notes.md",
+    sourceSummarySlug: "notes",
+    markdown: "",
+    llmConfig: {} as LocalizeOptions["llmConfig"],
+    multimodalConfig: {
+      concurrency: 4,
+      captionModel: "test-model",
+      minImagePixelSize: 64,
+      imageFetchTimeoutMs: 5_000,
+      urlCacheTtlDays: 45,
+      localizeMarkdownImages: true,
+    } as unknown as LocalizeOptions["multimodalConfig"],
+    ...overrides,
+  }
+}
+
+/** Install a global fetch stub for one test. */
+function stubFetch(impl: (url: string, init: RequestInit) => Promise<Response>) {
+  const spy = vi.fn(impl)
+  vi.stubGlobal("fetch", spy)
+  return spy
+}
+
+describe("localizeMarkdownImages — Group D caching (tests 14-17)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it("test 14 — URL cache TTL fresh: no HTTP call, urlCacheHits === 1", async () => {
+    const url = "https://example.com/cat.png"
+    const cached: UrlCacheEntry = {
+      sha256: "0123456789abcdef".repeat(4),
+      mimeType: "image/png",
+      width: 0,
+      height: 0,
+      bytesLen: 1234,
+      fetchedAt: new Date().toISOString(),
+      canonicalRelPath: "wiki/media/notes/cat-01234567.png",
+    }
+    // fileExists returns true for the URL cache file and the
+    // canonical media file; false otherwise.
+    mockFileExists.mockImplementation(async (p: string) => {
+      if (p.endsWith("image-url-cache.json")) return true
+      if (p.endsWith("cat-01234567.png")) return true
+      return false
+    })
+    mockReadFile.mockResolvedValue(JSON.stringify({ [url]: cached }))
+    const fetchSpy = stubFetch(async () => new Response("", { status: 500 }))
+
+    const result = await localizeMarkdownImages(
+      makeOpts({ markdown: `Look: ![](${url})` }),
+    )
+
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(result.stats.urlCacheHits).toBe(1)
+    expect(result.stats.downloaded).toBe(0)
+    expect(result.stats.failed).toBe(0)
+    expect(result.savedImages).toHaveLength(1)
+    expect(result.savedImages[0].relPath).toBe("media/notes/cat-01234567.png")
+  })
+
+  it("test 15 — URL cache expired: HTTP call happens, cache re-upserted", async () => {
+    const url = "https://example.com/logo.png"
+    // 90 days old → expired against 45-day default TTL.
+    const stale: UrlCacheEntry = {
+      sha256: "aa".repeat(32),
+      mimeType: "image/png",
+      width: 0,
+      height: 0,
+      bytesLen: 999,
+      fetchedAt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
+      canonicalRelPath: "wiki/media/notes/logo-aabbccdd.png",
+    }
+    // Cache file present; canonical media file exists too, but TTL is
+    // stale so we still re-fetch. Media write target does NOT exist
+    // yet at the new sha8 path.
+    mockFileExists.mockImplementation(async (p: string) => {
+      if (p.endsWith("image-url-cache.json")) return true
+      if (p.endsWith("logo-aabbccdd.png")) return true
+      return false
+    })
+    mockReadFile.mockResolvedValue(JSON.stringify({ [url]: stale }))
+
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3])
+    const fetchSpy = stubFetch(async () =>
+      new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    )
+
+    const result = await localizeMarkdownImages(
+      makeOpts({ markdown: `![](${url})` }),
+    )
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(result.stats.downloaded).toBe(1)
+    expect(result.stats.urlCacheHits).toBe(0)
+    expect(result.stats.failed).toBe(0)
+    expect(mockWriteFileBase64).toHaveBeenCalledTimes(1)
+    // Cache was upserted with the new fetch (write of the JSON file).
+    expect(mockWriteFile).toHaveBeenCalled()
+    const [, cacheJson] = mockWriteFile.mock.calls[0]
+    const parsed = JSON.parse(cacheJson)
+    expect(parsed[url]).toBeDefined()
+    // fetchedAt bumped to now (within a few seconds).
+    const bumped = Date.parse(parsed[url].fetchedAt)
+    expect(Math.abs(bumped - Date.now())).toBeLessThan(5_000)
+  })
+
+  it("test 17 — cold path: HTTP fetch + write + cache create", async () => {
+    const url = "https://example.com/fresh.png"
+    // No cache file, no media file.
+    mockFileExists.mockResolvedValue(false)
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const fetchSpy = stubFetch(async () =>
+      new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    )
+
+    const result = await localizeMarkdownImages(
+      makeOpts({ markdown: `![](${url})` }),
+    )
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(result.stats.downloaded).toBe(1)
+    expect(mockWriteFileBase64).toHaveBeenCalledTimes(1)
+    // Written to /project/wiki/media/notes/fresh-<sha8>.png
+    const [writePath] = mockWriteFileBase64.mock.calls[0]
+    expect(writePath).toMatch(
+      /^\/project\/wiki\/media\/notes\/fresh-[0-9a-f]{8}\.png$/,
+    )
+    // Cache file written too.
+    expect(mockCreateDirectory).toHaveBeenCalledWith("/project/.llm-wiki")
+    expect(mockWriteFile).toHaveBeenCalled()
+    // SavedImages surfaces the correct relPath (wiki-relative).
+    expect(result.savedImages).toHaveLength(1)
+    expect(result.savedImages[0].relPath).toMatch(
+      /^media\/notes\/fresh-[0-9a-f]{8}\.png$/,
+    )
+  })
+
+  it("no image refs → early return with zero stats and no I/O", async () => {
+    mockFileExists.mockResolvedValue(false)
+    const fetchSpy = stubFetch(async () => new Response(""))
+    const result = await localizeMarkdownImages(
+      makeOpts({ markdown: "Just prose. No images." }),
+    )
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(mockCreateDirectory).not.toHaveBeenCalled()
+    expect(result.stats.downloaded).toBe(0)
+    expect(result.stats.failed).toBe(0)
+    expect(result.savedImages).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Main-entry branches — data-uri, local-relative, already-localized, mixed
+// ---------------------------------------------------------------------------
+
+describe("localizeMarkdownImages — non-remote branches", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it("data-uri branch: decodes, writes to wiki/media/, stats.decoded === 1", async () => {
+    mockFileExists.mockResolvedValue(false)
+    const dataUri = `data:image/png;base64,${RED_1x1_PNG_B64}`
+    const result = await localizeMarkdownImages(
+      makeOpts({ markdown: `![](${dataUri})` }),
+    )
+    expect(result.stats.decoded).toBe(1)
+    expect(result.stats.downloaded).toBe(0)
+    expect(mockWriteFileBase64).toHaveBeenCalledTimes(1)
+    const [writePath] = mockWriteFileBase64.mock.calls[0]
+    expect(writePath).toMatch(
+      /^\/project\/wiki\/media\/notes\/inline-[0-9a-f]{8}\.png$/,
+    )
+  })
+
+  it("local-relative branch: reads source, copies to media dir, stats.copied === 1", async () => {
+    // File exists at source location + never at target.
+    mockFileExists.mockImplementation(async (p: string) => {
+      if (p === "/project/raw/assets/pic.png") return true
+      if (p.endsWith("image-url-cache.json")) return false
+      return false
+    })
+    // Rust probe returns a valid PNG base64.
+    mockReadFileAsBase64.mockResolvedValue({
+      base64: RED_1x1_PNG_B64,
+      mimeType: "image/png",
+    })
+    stubFetch(async () => new Response("", { status: 500 }))
+
+    const result = await localizeMarkdownImages(
+      makeOpts({ markdown: "![alt](../assets/pic.png)" }),
+    )
+
+    expect(result.stats.copied).toBe(1)
+    expect(result.stats.failed).toBe(0)
+    expect(mockCopyFile).toHaveBeenCalledTimes(1)
+    const [src, dst] = mockCopyFile.mock.calls[0]
+    expect(src).toBe("/project/raw/assets/pic.png")
+    expect(dst).toMatch(
+      /^\/project\/wiki\/media\/notes\/pic-[0-9a-f]{8}\.png$/,
+    )
+  })
+
+  it("already-localized branch: no I/O side effects, stats.alreadyLocalized === 1", async () => {
+    mockFileExists.mockImplementation(async (p: string) => {
+      if (p.endsWith("cached-abc12345.png")) return true
+      return false
+    })
+    stubFetch(async () => new Response("", { status: 500 }))
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: "![](../../wiki/media/notes/cached-abc12345.png)",
+      }),
+    )
+
+    expect(result.stats.alreadyLocalized).toBe(1)
+    expect(result.stats.downloaded).toBe(0)
+    expect(mockWriteFileBase64).not.toHaveBeenCalled()
+    expect(mockCopyFile).not.toHaveBeenCalled()
+    // already-localized refs are NOT surfaced in savedImages (see main entry filter).
+    expect(result.savedImages).toEqual([])
+  })
+
+  it("mixed body: 1 remote + 1 data-uri + 1 already-localized → correct stats fan-out", async () => {
+    mockFileExists.mockImplementation(async (p: string) => {
+      if (p.endsWith("cached-abc12345.png")) return true
+      return false
+    })
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    stubFetch(async () =>
+      new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    )
+
+    const md = [
+      "![](https://example.com/one.png)",
+      `![](data:image/png;base64,${RED_1x1_PNG_B64})`,
+      "![](../../wiki/media/notes/cached-abc12345.png)",
+    ].join("\n\n")
+
+    const result = await localizeMarkdownImages(makeOpts({ markdown: md }))
+
+    expect(result.stats.downloaded).toBe(1)
+    expect(result.stats.decoded).toBe(1)
+    expect(result.stats.alreadyLocalized).toBe(1)
+    expect(result.stats.failed).toBe(0)
+    // remote + data-uri surface as savedImages; already-localized doesn't.
+    expect(result.savedImages).toHaveLength(2)
+  })
+
+  it("failed refs are counted, not thrown", async () => {
+    // path-traversal ref → classifier returns 'failed' → counted, not thrown.
+    stubFetch(async () => new Response("", { status: 500 }))
+    const result = await localizeMarkdownImages(
+      makeOpts({ markdown: "![](../../../../etc/passwd)" }),
+    )
+    expect(result.stats.failed).toBe(1)
+    expect(mockWriteFileBase64).not.toHaveBeenCalled()
+  })
+
+  it("body-side fetch throw → counted as failed, batch continues to next ref", async () => {
+    mockFileExists.mockResolvedValue(false)
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    let call = 0
+    stubFetch(async () => {
+      call += 1
+      if (call === 1) throw new Error("network flake")
+      return new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      })
+    })
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: [
+          "![](https://example.com/first.png)",
+          "![](https://example.com/second.png)",
+        ].join("\n"),
+      }),
+    )
+    spy.mockRestore()
+    expect(result.stats.failed).toBe(1)
+    expect(result.stats.downloaded).toBe(1)
   })
 })
