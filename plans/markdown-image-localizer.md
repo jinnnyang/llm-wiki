@@ -1,6 +1,6 @@
 # Markdown image localizer
 
-**Status:** Spec v3 (revised 2026-07-23 after second review round). Branch: `feat/markdown-image-localizer`, cut from `main` at `e8bdec6` (upstream v0.6.5 tip).
+**Status:** Spec v3.1 (revised 2026-07-23 after third review round — spec-vs-code alignment fixes: C1 export gaps, C2 codex-cli throw semantics, C3 `isMarkdown` binding, C4 cache-key composition). Branch: `feat/markdown-image-localizer`, cut from `main` at `e8bdec6` (upstream v0.6.5 tip).
 
 **Predecessor:** `plans/multimodal-images.md` — landed the PDF/PPTX/DOCX image-extraction + VLM caption pipeline in v0.6.4. This plan extends the same pipeline to **markdown inputs**.
 
@@ -39,14 +39,16 @@ Read the following before touching code:
 | `captionMarkdownImages` | `src/lib/image-caption-pipeline.ts:283` | Iterates `MD_IMAGE_RE` matches, VLM-captions each, rewrites alt text. SHA-256 cache at `.llm-wiki/image-caption-cache.json`. |
 | `MD_IMAGE_RE` | `src/lib/image-caption-pipeline.ts:141` | Regex: `/(!\[)([^\]]*)(\]\()([^)\s]+)(\))/g` — **does not capture "title"**, splits url on first whitespace. Must extend. |
 | `findImageReferences` | `src/lib/image-caption-pipeline.ts:178` | Uses `MD_IMAGE_RE.exec()` loop to collect refs with source offsets. |
-| `captionImage` | `src/lib/vision-caption.ts` | Single-image VLM call. Takes `imageBase64`, `mediaType`. Codex-CLI transport is a no-op. Confirm line number in Commit 3. |
+| `captionImage` | `src/lib/vision-caption.ts:155` | Single-image VLM call. Takes `imageBase64`, `mediaType`. **Throws** on `codex-cli` provider (`vision-caption.ts:162`) — NOT a silent no-op. The localizer must pre-check the provider and skip the VLM branch entirely; see §1 "Provider capability gate". |
 | `extractAndSaveMarkdownImages` | `src/lib/extract-source-images.ts:200` | Handles **local** relative refs (`![](../assets/x.png)`) — copyFile to `wiki/media/<slug>/`. Do NOT collide with this. |
 | `fetchImportUrl` | `src/lib/url-source-import.ts:86` | HTTP fetch with SSRF/private-network/redirect defenses. Reuse verbatim. |
-| `validateHttpUrl`, `isPrivateNetworkHost`, `safeSlug` | `src/lib/url-source-import.ts` | Reuse verbatim — SSRF defense + Windows-reserved-name slug. |
+| `validateHttpUrl`, `isPrivateNetworkHost`, `safeSlug` | `src/lib/url-source-import.ts:44/74/117` | Reuse verbatim — SSRF defense + Windows-reserved-name slug. ⚠️ **These are currently module-private** (no `export` keyword). Commit 1 must add `export` to each so the localizer can import them. |
 | `getHttpFetch` | `src/lib/tauri-fetch.ts:41` | Tauri http plugin wrapper. |
 | `writeFileBase64` | `src/commands/fs.ts` | Binary write via Rust `write_file_base64`. Confirm line number in Commit 3. |
 | `parseFrontmatter` | `src/lib/frontmatter.ts:37` | Returns `{ frontmatter, body, rawBlock }`. Preserves untouched YAML when we edit only the body. Reuse for `image_sources:` mapping. |
-| `checkIngestCache` / `saveIngestCache` | `src/lib/ingest-cache.ts:61 / :98` | SHA-256 cache keyed by `sourceIdentity`. `filesWritten` is validated for existence on hit. **`saveIngestCache` is the "update hash key" entry point (see §8).** |
+| `checkIngestCache` / `saveIngestCache` | `src/lib/ingest-cache.ts:61 / :98` | SHA-256 cache keyed by `sourceIdentity`. `filesWritten` is validated for existence on hit. **`saveIngestCache` is the "update hash key" entry point (see §8).** Commit 1 changes the third parameter's semantics from "sourceContent" to "hashInput" (see §8 Cache-key composition). |
+| `sourceIdentityForPath` / `sourceSummarySlugFromIdentity` | `src/lib/ingest.ts:649 / :650` (via `@/lib/source-identity`) | Produce the `sourceIdentity` and `sourceSummarySlug` values that flow into `LocalizeOptions`. |
+| `isInsideProject` | `src/lib/markdown-image-resolver.ts:50` | Path-traversal defense. ⚠️ **Currently module-private**; Commit 1 must add `export`. |
 | `MultimodalConfig` | `src/stores/wiki-store.ts:296` | Add new fields here. |
 | `autoIngestImpl` | `src/lib/ingest.ts:637` | Integration point. Insert new "Step 0.4" between source read (line ~704) and cache check (line ~729). |
 | `injectImagesIntoSourceSummary` | `src/lib/ingest.ts:2809` | Wiki-summary image injection — the safety-net `## Embedded Images` block. Behavior with markdown-localized images: see §8. |
@@ -89,6 +91,27 @@ Runtime files:
 **Interaction with the master toggle:** `multimodalConfig.localizeMarkdownImages: boolean` (default `true`) is the outermost gate.
 - `false` → the entire Step 0.4 hook is bypassed; byte-identical to pre-v0.6.6 behavior.
 - `true` → the decision matrix above runs per image.
+
+**Provider capability gate (v3 addition):** the VLM branch of Axis B (empty alt → run VLM) is gated by whether the active LLM provider supports image input. Currently only `codex-cli` fails this check — `captionImage` (`vision-caption.ts:162`) throws immediately for that provider rather than silently returning empty text.
+
+The localizer must pre-check the provider **once, at the top of `localizeMarkdownImages`**, not per image:
+
+```typescript
+const canRunVlm = opts.llmConfig.provider !== "codex-cli"
+```
+
+When `canRunVlm === false`, every image is routed as if it had a non-empty author alt — regardless of what Axis B says. Concretely:
+- I/O still happens: `remote-http` downloads, `local-relative` copyFiles, `data-uri` decodes. Bytes land on disk with `-<sha8>` suffix as usual.
+- URL rewriting still happens: the body's `url` field is replaced with the local path.
+- VLM is skipped entirely: no `captionImage` call is issued for any image in this batch.
+- Author alt and title are preserved verbatim (whatever the author wrote, including empty strings, stays as-is).
+
+This preserves the "localizer as gap-filler" invariant even when the gap can't be filled — the user gets link-rot protection and byte-preservation with zero errors, and can re-run the ingest later after switching to a VLM-capable provider (which will then only spend VLM calls on the still-empty-alt images).
+
+**Rationale for a single upfront check rather than per-image try/catch:**
+- Cheaper: one check vs. N throw/catch pairs on a big markdown corpus.
+- Cleaner stats: distinguishes "provider can't run VLM" from "author wrote alt" from "image too small" (see §6 `LocalizeResult.stats.skippedNoVlmProvider`).
+- Matches the existing pattern in `captionMarkdownImages` (`image-caption-pipeline.ts:309`), which also short-circuits at the top rather than per-image. The difference: that function returns everything as `failed`; the localizer returns everything as "downloaded/copied but VLM-skipped, no failure".
 
 **Rationale for the two-axis model (v3):**
 
@@ -232,6 +255,7 @@ export interface LocalizeResult {
     captionCacheHits: number   // caption cache hits (SHA-keyed)
     skippedAuthorAlt: number   // author supplied non-empty alt; VLM skipped
     skippedTooSmall: number    // empty alt but below minImagePixelSize; VLM skipped
+    skippedNoVlmProvider: number // provider can't run VLM (codex-cli); ALL images with empty alt get counted here regardless of size/kind
     // failures
     failed: number
   }
@@ -298,6 +322,8 @@ CJK note: user's environment is Chinese; the curly-quote substitution is safer t
 
 Insert a new **Step 0.4** immediately after source content is read (line ~710) and **before** the cache-lookup at line ~729. The localizer runs on **both cache-miss and cache-hit paths** — uniform placement is what makes the cache mechanics below sound.
 
+**Line-number convention (v3):** every line number in this section (`~710`, `729`, `738`, `767`, `836`, `1227`) is the current tip anchor at v3 spec time. Commit 5 introduces new lines (the `isMarkdown` binding, the Step 0.4 block itself) which will shift every downstream line by a small offset. Do **not** rely on these line numbers when applying Commit 5 — use `grep` on the symbol names (`checkIngestCache`, `extractAndSaveMarkdownImages`, `appendSavedImageRefsForCaption`, `saveIngestCache`) as the durable anchor. The line numbers here are for orientation only.
+
 **Naming convention (v3):** in `autoIngestImpl` scope, the ingest-cache functions are called with `sourceIdentity` as the second argument. That variable is produced by `sourceIdentityForPath(pp, sp)` at line 649 and is *not* renamed in this plan. The `ingest-cache.ts` implementation calls the same parameter `sourceFileName` (see `ingest-cache.ts:63/100/120`) — that's the historical name of the parameter, unchanged; only the ingest-side variable name differs. **Do not introduce a third name**; keep passing `sourceIdentity` at every call site in `ingest.ts`.
 
 The v2 plan claimed Step 8a was "idempotent — same key same value" on the cold-start (miss) path. That claim was wrong: on cold start, if we only rebind the cache under the `if (cachedFiles !== null)` branch, the pipeline-end `saveIngestCache` at line 1227 stores the *old* hash (of `sourceContent`) while disk holds the *new* content (`workingSourceContent`). Source-watch reenqueue then misses the cache and re-runs the whole pipeline. The v3 fix is to **propagate `workingSourceContent` through the entire downstream pipeline** so every hash computation uses the current on-disk state.
@@ -309,6 +335,13 @@ The v2 plan claimed Step 8a was "idempotent — same key same value" on the cold
 // gets its bytes localized to wiki/media/, and its alt/title filled in
 // by the VLM only when the author left alt empty. Runs on both cache-
 // miss and cache-hit paths; the rebind below closes the cache loop.
+
+// Note: `isMarkdown` is NOT defined at this point in the current tip
+// (only `lowerExt` and `isPdf` — see ingest.ts:663–664). Commit 5 must
+// add this binding immediately after `isPdf`:
+const isMarkdown = lowerExt === "md" || lowerExt === "markdown"
+// Intentionally narrow: `.mdx` and other variants have divergent syntax
+// (JSX embedding, custom extensions) and are out of scope for Phase 1.
 
 let workingSourceContent = sourceContent
 let markdownLocalizedImages: SavedImage[] = []
@@ -356,21 +389,25 @@ if (
   }
 }
 
-// ── existing line 729: cache check now uses workingSourceContent ──
-const cachedFiles = await checkIngestCache(pp, sourceIdentity, workingSourceContent)
-//                                                             ^^^^^^^^^^^^^^^^^^^^^^
-//                                                             was: sourceContent
+// ── existing line 729: cache check now uses workingSourceContent
+//    threaded through buildIngestHashInput (see §8 Cache-key composition) ──
+const cachedFiles = await checkIngestCache(
+  pp,
+  sourceIdentity,
+  buildIngestHashInput(workingSourceContent, mmCfg),
+)
+// was: checkIngestCache(pp, sourceIdentity, sourceContent)
 ```
 
-**Unified propagation (Commit 5 scope):** the following existing call sites in `autoIngestImpl` must switch from `sourceContent` to `workingSourceContent`:
+**Unified propagation (Commit 5 scope):** the following existing call sites in `autoIngestImpl` must switch from `sourceContent` to `workingSourceContent`, and the cache-touching sites additionally wrap through `buildIngestHashInput` per the Cache-key composition section below:
 
 | Line | Current call | v3 call |
 |---|---|---|
-| 729 | `checkIngestCache(pp, sourceIdentity, sourceContent)` | `checkIngestCache(pp, sourceIdentity, workingSourceContent)` |
+| 729 | `checkIngestCache(pp, sourceIdentity, sourceContent)` | `checkIngestCache(pp, sourceIdentity, buildIngestHashInput(workingSourceContent, mmCfg))` |
 | 738 | `extractAndSaveMarkdownImages(pp, sp, sourceContent, sourceSummarySlug)` | **remove call** — see coordination note below |
 | 767 | `appendSavedImageRefsForCaption(sourceContent, savedImages)` | `appendSavedImageRefsForCaption(workingSourceContent, savedImages)` — plus special-case, see coordination note |
 | 836 | `extractAndSaveMarkdownImages(pp, sp, sourceContent, sourceSummarySlug)` (full-pipeline branch) | **remove call** — see coordination note below |
-| 1227 | `saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths)` | `saveIngestCache(pp, sourceIdentity, workingSourceContent, writtenPaths)` |
+| 1227 | `saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths)` | `saveIngestCache(pp, sourceIdentity, buildIngestHashInput(workingSourceContent, mmCfg), writtenPaths)` |
 
 Any other read of `sourceContent` after Step 0.4 that eventually gets fed to a wiki-side pipeline (LLM generation prompt, embedding input) should also switch to `workingSourceContent`. Grep for `sourceContent` in `ingest.ts` at Commit 5 time and audit each hit.
 
@@ -394,14 +431,40 @@ So when `mmCfg.enabled && mmCfg.localizeMarkdownImages`, **skip the `extractAndS
 
 For **repeat ingests within the URL cache TTL**, the localizer's Axis A cache short-circuits happen inside `localizeMarkdownImages`: URL cache hits skip the network, SHA cache hits skip the VLM, `already-localized` skips everything. So `workingSourceContent` is byte-identical to `sourceContent` on second run — the ingest cache hits at line 729 and the whole `autoIngestImpl` returns early. First-time ingest with v3 pays for one full-pipeline run; every subsequent ingest is a cache hit.
 
-**Cache-key composition (Commit 1 change):** the current key is just `sha256(sourceContent)`. To make the cache correctly invalidate when the user toggles `localizeMarkdownImages`, extend the hashed material:
+**Cache-key composition (Commit 1 change):** the current cache key is `sha256(sourceContent)`. To make the cache correctly invalidate when the user toggles `localizeMarkdownImages`, the key needs to fold that flag into the hash. Rather than plumb `mmCfg` through `ingest-cache.ts` (which would either bloat the signature or force a store dependency at the wrong layer), we shift responsibility to the caller.
 
-```
-hashInput = content + "\n\n---cache-fingerprint---\n" +
-            "localize=" + (mmCfg.localizeMarkdownImages ? "1" : "0") + "\n"
-```
+**The change has two parts:**
 
-(where `content` is whatever the caller passes — `sourceContent` today, `workingSourceContent` after Commit 5). Two-line change in `ingest-cache.ts`. `minImagePixelSize` and `urlCacheTtlDays` are not part of the fingerprint — they only affect per-image behavior, not output shape, and changing them mid-project shouldn't force a full re-ingest.
+1. In `src/lib/ingest-cache.ts`, rename the third parameter of `checkIngestCache` and `saveIngestCache` from `sourceContent` to `hashInput`. Internal body (`await sha256(...)`) is unchanged — the function now treats its input as an opaque hashable string. JSDoc updated:
+
+   ```typescript
+   /**
+    * @param hashInput  Caller assembles this. For the ingest pipeline
+    *                   the convention is:
+    *                     `${content}\n\n---cache-fingerprint---\nlocalize=${flag}\n`
+    *                   See `buildIngestHashInput` in ingest.ts.
+    */
+   ```
+
+2. In `src/lib/ingest.ts`, add a new helper immediately before `autoIngestImpl`:
+
+   ```typescript
+   function buildIngestHashInput(content: string, mmCfg: MultimodalConfig): string {
+     const localize = mmCfg.enabled && mmCfg.localizeMarkdownImages ? "1" : "0"
+     return `${content}\n\n---cache-fingerprint---\nlocalize=${localize}\n`
+   }
+   ```
+
+   Every current `checkIngestCache(pp, sourceIdentity, sourceContent)` / `saveIngestCache(pp, sourceIdentity, sourceContent, ...)` call site is updated to wrap the third argument in `buildIngestHashInput(workingSourceContent, mmCfg)`. After Commit 5 this is 2 sites (line 729 → `workingSourceContent`, line 1227 → `workingSourceContent`), plus any other `saveIngestCache` caller found via grep.
+
+**Fingerprint scope:** `minImagePixelSize` and `urlCacheTtlDays` are deliberately **not** in the fingerprint — they only affect per-image internal behavior (whether the VLM runs, when to refresh the URL cache), not the output shape written to `raw/sources/<slug>.md` or `wiki/sources/<slug>.md`. Changing them mid-project shouldn't force a full re-ingest of every source. If future fingerprint dimensions are added (e.g., a mineru version bump), extend the `buildIngestHashInput` helper's format string — no changes to `ingest-cache.ts` needed.
+
+**Rationale for putting composition in the caller:**
+
+- `ingest-cache.ts` stays a pure lower layer: file I/O + sha256. It knows nothing about multimodal config or store state, so it stays trivially testable.
+- No circular-dependency risk from `ingest-cache.ts` importing the store.
+- Adding a new fingerprint dimension in the future is a one-line change to `buildIngestHashInput` — the cache module signature is stable forever.
+- The `ingest-cache.test.ts` fingerprint tests target `buildIngestHashInput` directly (pure function → trivial assertions) without needing to mock a store.
 
 **Source-watch reenqueue:** the write in Step 0.4 will trigger source-watch. That's fine — the workingSourceContent propagation ensures the reenqueued ingest is an I/O-free cache hit. The activity panel will show an extra ingest entry per localized file on the first ingest after the feature ships; that's the visible price of a one-shot backfill and is acceptable. If we later want to hide it, add an in-flight self-write suppression set to `project-file-sync`; deferred to Phase 3.
 
@@ -526,9 +589,11 @@ src/lib/markdown-image-localizer.test.ts          ~280 LOC
 **Modified files:**
 ```
 src/lib/image-caption-pipeline.ts                 +~15 LOC  (CaptionEntry optional fields)
-src/lib/ingest.ts                                 +~55 LOC  (Step 0.4 hook + Step 8a rebind)
-src/lib/ingest-cache.ts                           +~10 LOC  (cache-fingerprint composition)
-src/stores/wiki-store.ts                          +~10 LOC  (MultimodalConfig fields + defaults)
+src/lib/ingest.ts                                 +~60 LOC  (Step 0.4 hook + isMarkdown + buildIngestHashInput helper + workingSourceContent propagation)
+src/lib/ingest-cache.ts                           +~5 LOC   (param rename sourceContent → hashInput + JSDoc)
+src/lib/url-source-import.ts                      +3 tokens (add `export` to 3 private functions)
+src/lib/markdown-image-resolver.ts                +1 token  (add `export` to isInsideProject)
+src/stores/wiki-store.ts                          +~15 LOC  (MultimodalConfig fields + defaults)
 ```
 
 Zero deletions. All modifications are additive; existing behavior when `localizeMarkdownImages === false` is byte-identical to today.
@@ -607,7 +672,14 @@ Test cases (each 2-5 min to implement, TDD one at a time):
 27. Failure isolation: one URL 404s, other 5 URLs still succeed.
 28. Title escape (generator side): VLM returns caption containing `"` → written markdown uses `\u201D` curly quote, not `\"`. Verify parser round-trips.
 29. Alt escape (generator side): VLM returns alt containing `]` → written markdown uses `\]`. Alt with newline → single space.
-30. Codex-CLI provider → download/copy + rewrite links run; VLM step skipped for empty-alt images; alt stays original (empty); `stats.captioned === 0`. `stats.copied` / `stats.downloaded` reflect actual I/O.
+30. **Codex-CLI provider** (§1 Provider capability gate) → I/O runs normally (download / copy / decode); VLM is skipped batch-wide via the upfront `canRunVlm` check, NOT via per-image throw. `captionImage` must never be invoked in this test. Assertions:
+    - `stats.captioned === 0` (no VLM calls)
+    - `stats.failed === 0` (skipping ≠ failure)
+    - `stats.skippedNoVlmProvider === <count of empty-alt images in fixture>` (all empty-alt images routed to no-VLM branch)
+    - `stats.skippedAuthorAlt === <count of non-empty-alt images>` (non-empty-alt images still land here; the two skip counters partition the "no VLM call happened" set)
+    - `stats.skippedTooSmall === 0` (threshold check is downstream of the provider gate; when provider gate closes, threshold is not consulted)
+    - `stats.downloaded` / `stats.copied` / `stats.decoded` reflect actual I/O
+    - Written alt in output markdown is byte-identical to author's input (empty stays empty; non-empty stays non-empty)
 
 ### Cache-fingerprint tests (`ingest-cache.test.ts` — extend existing)
 
@@ -689,7 +761,7 @@ Ingest via the UI. Verify by inspecting `raw/sources/<slug>.md`:
 
 | # | Scope | Files | Test gate |
 |---|---|---|---|
-| 1 | `MultimodalConfig` schema + defaults (add `localizeMarkdownImages`, `minImagePixelSize`, `urlCacheTtlDays`, `imageFetchTimeoutMs`); cache-fingerprint composition | `src/stores/wiki-store.ts`, `src/lib/ingest-cache.ts` + extended test | typecheck; `ingest-cache.test.ts` incl. new fingerprint cases |
+| 1 | `MultimodalConfig` schema + defaults (add `localizeMarkdownImages`, `minImagePixelSize`, `urlCacheTtlDays`, `imageFetchTimeoutMs`); cache-key parameter rename (`sourceContent` → `hashInput`) + new `buildIngestHashInput` helper in ingest.ts; **expose reused defenses**: add `export` to `validateHttpUrl`, `isPrivateNetworkHost`, `safeSlug` in `url-source-import.ts` and to `isInsideProject` in `markdown-image-resolver.ts` | `src/stores/wiki-store.ts`, `src/lib/ingest-cache.ts`, `src/lib/ingest.ts`, `src/lib/url-source-import.ts`, `src/lib/markdown-image-resolver.ts` + extended test | typecheck; `ingest-cache.test.ts` incl. new fingerprint cases; `import { validateHttpUrl } from "@/lib/url-source-import"` compiles from a scratch test file |
 | 2 | `CaptionEntry` optional fields (title, originalUrl), forward-compat | `src/lib/image-caption-pipeline.ts` | existing 21 caption tests stay green |
 | 3 | Localizer module — **core plumbing** (URL classification with 3-step already-localized check, URL cache w/ per-entry upsert, HTTP download with SSRF + Content-Length + timeout defense, copyFile local path, data URI decode w/ truncation, SHA-256 dedup, `resolveLocalRelative` w/ `isInsideProject`, NO VLM yet) | `src/lib/markdown-image-localizer.ts`, first half of `markdown-image-localizer.test.ts` (Groups A, D, E — tests 1-2, 14-23) | new module tests |
 | 4 | Localizer — **decision matrix + VLM + rewrite + frontmatter** (§1 axis-B gating, `captionImage` integration with codex-cli fallback, both `rewrittenSourceMarkdown` and `rewrittenWikiMarkdown` outputs via §7 regex + §4 path helper, `parseFrontmatter` merge with §11 lifecycle rules, generator-side escape) | rest of `markdown-image-localizer.ts` + rest of `.test.ts` (Groups B, C, F + integration tests — tests 3-13, 24-34) | all new module tests |
