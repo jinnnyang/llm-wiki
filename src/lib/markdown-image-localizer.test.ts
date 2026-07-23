@@ -5,6 +5,9 @@ import { describe, it, expect, beforeEach, vi } from "vitest"
 // `probeImageDimensions`; filesystem probes use module-level vi.mock.
 vi.mock("@/commands/fs", () => ({
   fileExists: vi.fn(),
+  readFile: vi.fn(),
+  writeFile: vi.fn(),
+  createDirectory: vi.fn(),
 }))
 
 import {
@@ -13,13 +16,27 @@ import {
   classifyImageUrl,
   resolveLocalRelative,
   ALREADY_LOCALIZED_SUFFIX_RE,
+  URL_CACHE_REL_PATH,
+  readUrlCache,
+  upsertUrlCacheEntry,
+  isUrlCacheEntryFresh,
+  sha8OfBytes,
+  type UrlCacheEntry,
 } from "./markdown-image-localizer"
-import { fileExists } from "@/commands/fs"
+import { fileExists, readFile, writeFile, createDirectory } from "@/commands/fs"
 
 const mockFileExists = vi.mocked(fileExists)
+const mockReadFile = vi.mocked(readFile)
+const mockWriteFile = vi.mocked(writeFile)
+const mockCreateDirectory = vi.mocked(createDirectory)
 
 beforeEach(() => {
   mockFileExists.mockReset()
+  mockReadFile.mockReset()
+  mockWriteFile.mockReset()
+  mockCreateDirectory.mockReset()
+  mockWriteFile.mockResolvedValue(undefined as unknown as void)
+  mockCreateDirectory.mockResolvedValue(undefined as unknown as void)
 })
 
 // ---------------------------------------------------------------------------
@@ -331,5 +348,201 @@ describe("ALREADY_LOCALIZED_SUFFIX_RE — matches only the localized shape", () 
         "/project/wiki/media/notes/foo-ABC12345.png",
       ),
     ).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// URL cache — data layer (Commit 3b; §3.2)
+// ---------------------------------------------------------------------------
+
+/** Sample entry used across the URL cache tests. */
+const sampleEntry: UrlCacheEntry = {
+  sha256: "0123456789abcdef".repeat(4),
+  mimeType: "image/png",
+  width: 640,
+  height: 480,
+  bytesLen: 12345,
+  fetchedAt: "2026-07-23T00:00:00.000Z",
+  canonicalRelPath: "wiki/media/slug/logo-01234567.png",
+}
+
+describe("readUrlCache — corrupt-tolerant loader (§Risk #5)", () => {
+  it("returns empty map when the cache file does not exist", async () => {
+    mockFileExists.mockResolvedValue(false)
+    const out = await readUrlCache("/project")
+    expect(out).toEqual({})
+    expect(mockReadFile).not.toHaveBeenCalled()
+  })
+
+  it("probes the exact cache path at .llm-wiki/image-url-cache.json", async () => {
+    mockFileExists.mockResolvedValue(false)
+    await readUrlCache("/project")
+    expect(mockFileExists).toHaveBeenCalledWith(`/project/${URL_CACHE_REL_PATH}`)
+  })
+
+  it("returns the parsed cache on a well-formed JSON object", async () => {
+    mockFileExists.mockResolvedValue(true)
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ "https://x/y.png": sampleEntry }),
+    )
+    const out = await readUrlCache("/project")
+    expect(out).toEqual({ "https://x/y.png": sampleEntry })
+  })
+
+  it("warns and returns empty when JSON is malformed (recover, don't wedge)", async () => {
+    mockFileExists.mockResolvedValue(true)
+    mockReadFile.mockResolvedValue("{ not really json")
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const out = await readUrlCache("/project")
+    expect(out).toEqual({})
+    expect(spy).toHaveBeenCalled()
+    spy.mockRestore()
+  })
+
+  it("returns empty when the parsed value isn't a plain object (e.g. an array)", async () => {
+    mockFileExists.mockResolvedValue(true)
+    mockReadFile.mockResolvedValue(JSON.stringify(["not", "a", "map"]))
+    const out = await readUrlCache("/project")
+    expect(out).toEqual({})
+  })
+
+  it("returns empty when the parsed value is null", async () => {
+    mockFileExists.mockResolvedValue(true)
+    mockReadFile.mockResolvedValue("null")
+    const out = await readUrlCache("/project")
+    expect(out).toEqual({})
+  })
+})
+
+describe("upsertUrlCacheEntry — per-key merge write (§3.2 concurrency note)", () => {
+  it("writes the new entry when the cache didn't exist", async () => {
+    mockFileExists.mockResolvedValue(false)
+    await upsertUrlCacheEntry("/project", "https://a/1.png", sampleEntry)
+    expect(mockCreateDirectory).toHaveBeenCalledWith("/project/.llm-wiki")
+    expect(mockWriteFile).toHaveBeenCalledTimes(1)
+    const [path, body] = mockWriteFile.mock.calls[0]
+    expect(path).toBe(`/project/${URL_CACHE_REL_PATH}`)
+    expect(JSON.parse(body)).toEqual({ "https://a/1.png": sampleEntry })
+  })
+
+  it("preserves other keys when merging a new key into an existing cache", async () => {
+    const existing = { "https://a/1.png": sampleEntry }
+    mockFileExists.mockResolvedValue(true)
+    mockReadFile.mockResolvedValue(JSON.stringify(existing))
+    const secondEntry: UrlCacheEntry = {
+      ...sampleEntry,
+      sha256: "ffff".repeat(16),
+      canonicalRelPath: "wiki/media/slug/other-abcd1234.png",
+    }
+    await upsertUrlCacheEntry("/project", "https://b/2.png", secondEntry)
+    const written = JSON.parse(mockWriteFile.mock.calls[0][1])
+    expect(written).toEqual({
+      "https://a/1.png": sampleEntry,
+      "https://b/2.png": secondEntry,
+    })
+  })
+
+  it("overwrites the same key with the new entry (TTL bump path)", async () => {
+    const stale: UrlCacheEntry = {
+      ...sampleEntry,
+      fetchedAt: "2025-01-01T00:00:00.000Z",
+    }
+    mockFileExists.mockResolvedValue(true)
+    mockReadFile.mockResolvedValue(
+      JSON.stringify({ "https://x/y.png": stale }),
+    )
+    await upsertUrlCacheEntry("/project", "https://x/y.png", sampleEntry)
+    const written = JSON.parse(mockWriteFile.mock.calls[0][1])
+    expect(written).toEqual({ "https://x/y.png": sampleEntry })
+  })
+
+  it("recovers from a corrupt cache — treats it as empty and writes just the new entry", async () => {
+    mockFileExists.mockResolvedValue(true)
+    mockReadFile.mockResolvedValue("<< not json >>")
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {})
+    await upsertUrlCacheEntry("/project", "https://x/y.png", sampleEntry)
+    spy.mockRestore()
+    const written = JSON.parse(mockWriteFile.mock.calls[0][1])
+    expect(written).toEqual({ "https://x/y.png": sampleEntry })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isUrlCacheEntryFresh — TTL helper (§3.2)
+// ---------------------------------------------------------------------------
+
+describe("isUrlCacheEntryFresh — 45-day default TTL semantics", () => {
+  const day = 24 * 60 * 60 * 1000
+  const now = Date.parse("2026-07-23T00:00:00.000Z")
+
+  it("returns true when fetched an hour ago", () => {
+    const entry = { fetchedAt: new Date(now - 60 * 60 * 1000).toISOString() }
+    expect(isUrlCacheEntryFresh(entry, 45, now)).toBe(true)
+  })
+
+  it("returns true right up to the TTL boundary (inclusive)", () => {
+    const entry = { fetchedAt: new Date(now - 45 * day).toISOString() }
+    expect(isUrlCacheEntryFresh(entry, 45, now)).toBe(true)
+  })
+
+  it("returns false one millisecond past the TTL boundary", () => {
+    const entry = { fetchedAt: new Date(now - 45 * day - 1).toISOString() }
+    expect(isUrlCacheEntryFresh(entry, 45, now)).toBe(false)
+  })
+
+  it("returns false for a fetch older than 45 days when ttlDays=45", () => {
+    const entry = { fetchedAt: new Date(now - 100 * day).toISOString() }
+    expect(isUrlCacheEntryFresh(entry, 45, now)).toBe(false)
+  })
+
+  it("returns true when fetchedAt is in the future (clock-skew tolerance)", () => {
+    const entry = { fetchedAt: new Date(now + 5 * day).toISOString() }
+    expect(isUrlCacheEntryFresh(entry, 45, now)).toBe(true)
+  })
+
+  it("returns false when fetchedAt is malformed (safer: force re-fetch)", () => {
+    expect(isUrlCacheEntryFresh({ fetchedAt: "not a date" }, 45, now)).toBe(false)
+    expect(isUrlCacheEntryFresh({ fetchedAt: "" }, 45, now)).toBe(false)
+  })
+
+  it("respects a caller-supplied TTL of 0 (no freshness — every entry stale except right now)", () => {
+    // Exactly `now` still counts as fresh (0ms age ≤ 0ms TTL).
+    const entry = { fetchedAt: new Date(now).toISOString() }
+    expect(isUrlCacheEntryFresh(entry, 0, now)).toBe(true)
+    // 1ms older → stale.
+    const older = { fetchedAt: new Date(now - 1).toISOString() }
+    expect(isUrlCacheEntryFresh(older, 0, now)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// sha8OfBytes — filename disambiguator
+// ---------------------------------------------------------------------------
+
+describe("sha8OfBytes — 8-char lowercase hex prefix", () => {
+  it("returns exactly 8 hex chars", async () => {
+    const hex = await sha8OfBytes(new Uint8Array([1, 2, 3, 4]))
+    expect(hex).toMatch(/^[0-9a-f]{8}$/)
+  })
+
+  it("is deterministic for the same input bytes", async () => {
+    const a = await sha8OfBytes(new Uint8Array([9, 9, 9]))
+    const b = await sha8OfBytes(new Uint8Array([9, 9, 9]))
+    expect(a).toBe(b)
+  })
+
+  it("matches the SHA-256 prefix of the input (known vector)", async () => {
+    // SHA-256 of the ASCII bytes for "abc" is
+    //   ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+    // → prefix "ba7816bf".
+    const bytes = new TextEncoder().encode("abc")
+    const hex = await sha8OfBytes(bytes)
+    expect(hex).toBe("ba7816bf")
+  })
+
+  it("distinguishes distinct inputs (near-input collision would be a red flag)", async () => {
+    const a = await sha8OfBytes(new Uint8Array([0]))
+    const b = await sha8OfBytes(new Uint8Array([1]))
+    expect(a).not.toBe(b)
   })
 })
