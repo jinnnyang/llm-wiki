@@ -1,16 +1,16 @@
 ---
 kind: task
-last_updated: '2026-07-23T03:00:00+00:00'
-last_writer: take-over
-last_agent: hermes-agent
-session_id: session-2026-07-23-mdimg-review-2
-last_verified: '2026-07-23T03:00:00+00:00'
+last_updated: '2026-07-26T10:33:08+00:00'
+last_writer: hand-off
+last_agent: hermes-devops
+session_id: handoff-20260726
+last_verified: '2026-07-26T10:33:08+00:00'
 ---
 
 # Task — markdown image localizer (Phase 1)
 
 **Branch:** `feat/markdown-image-localizer` (based on `e8bdec6`, upstream v0.6.5 tip)
-**Overall status:** Plan reviewed twice, revised to v3. 5 commits laid out below.
+**Overall status:** All 5 planned commits done. Code review fixes + Phase 3 metadata embedding landed.
 
 ## Reference documents
 
@@ -32,7 +32,7 @@ Plan doc has full design details (§1-12), test matrix (34 cases across 6 groups
 ### From v3 revision (2026-07-23 afternoon, this session)
 
 - **Two-axis decision matrix (§1 of plan):** URL kind × author alt. VLM runs only when alt is empty (and image is over threshold, on a captionable URL kind). Non-empty author alt is preserved verbatim — accessibility work belongs to the author.
-- **Two-form body output:** `LocalizeResult` returns both `rewrittenSourceMarkdown` (`../../wiki/media/...`) and `rewrittenWikiMarkdown` (`../media/...`). Neither can be derived from the other.
+- **Two-form body output:** `LocalizeResult` returns both `rewrittenSourceMarkdown` (source-root-relative, e.g. `<source-root>/wiki/media/…`) and `rewrittenWikiMarkdown` (wiki-root-relative, e.g. `<wiki-root>/media/…`). Neither can be derived from the other.
 - **Cache convergence via `workingSourceContent` propagation.** The v2 "Step 8a rebind" idea had a hole on the cold-start path. v3 replaces it with propagating `workingSourceContent` through 5 downstream call sites in `autoIngestImpl` — every hash computation uses the current on-disk state.
 - **`extractAndSaveMarkdownImages` skipped when localizer enabled.** Local-relative paths now flow through the localizer's own copy path, gaining VLM captioning as a bonus.
 - **`already-localized` uses 3-step check** (resolve → regex → exists) against the absolute path form.
@@ -41,7 +41,7 @@ Plan doc has full design details (§1-12), test matrix (34 cases across 6 groups
 
 ## Commit plan (execute in order)
 
-### [ ] Commit 1 — MultimodalConfig schema + cache fingerprint
+### [x] Commit 1 — MultimodalConfig schema + cache fingerprint
 
 Files:
 
@@ -62,7 +62,7 @@ Extend `ingest-cache.ts` sha256 input with the fingerprint suffix (see plan §8 
 
 Verify: `npm run typecheck` + `ingest-cache.test.ts` green.
 
-### [ ] Commit 2 — CaptionEntry optional fields
+### [x] Commit 2 — CaptionEntry optional fields
 
 File:
 
@@ -74,7 +74,7 @@ Add optional `title?: string`, `originalUrl?: string` to `CaptionEntry`. Forward
 
 Verify: `npm run test` — existing 21 caption-pipeline cases must stay green.
 
-### [ ] Commit 3 — Localizer core plumbing (no VLM yet)
+### [x] Commit 3 — Localizer core plumbing (no VLM yet)
 
 Files:
 
@@ -99,7 +99,7 @@ Tests (plan §Testing Groups A, D, E): 1-2, 14-23.
 
 Verify: new module tests all green (17 tests).
 
-### [ ] Commit 4 — Localizer decision matrix + VLM + rewrite + frontmatter
+### [x] Commit 4 — Localizer decision matrix + VLM + rewrite + frontmatter
 
 Extend the same two files with:
 
@@ -114,7 +114,7 @@ Tests (plan §Testing Groups B, C, F + integration): 3-13, 24-34.
 
 Verify: all 34 new module tests green.
 
-### [ ] Commit 5 — autoIngestImpl integration + workingSourceContent propagation
+### [x] Commit 5 — autoIngestImpl integration + workingSourceContent propagation
 
 File:
 
@@ -137,6 +137,34 @@ Also wire `result.rewrittenWikiMarkdown` into the wiki-page seeder (candidate: `
 Grep-audit: `grep -n sourceContent src/lib/ingest.ts` after the edits; every post-Step-0.4 reference must be intentional.
 
 Verify: full `npm run test` + smoke ingest a fixture md file exercising all 4 decision-matrix cells (per plan §Testing "Integration (manual smoke)"). Confirm second ingest is a cache-hit no-op.
+
+## Post-plan work (2026-07-26)
+
+### [x] Code review fixes (commit `2182625`)
+
+- H1: CRLF offset in `findImageSourcesBlockInYaml` — regex now preserves `\r\n` separator length.
+- H3: `AbortSignal.any` fallback — manual `AbortController` composition when unavailable.
+- M1: removed duplicate `sha256OfBytesFull`, unified on `sha256Hex`.
+- M2: single SHA-256 per image, `sha8 = sha256.slice(0, 8)`.
+
+### [x] Phase 3 — metadata embedding (commit `3cda623`)
+
+New module `src/lib/image-metadata-embed.ts` + 15 tests. Writes VLM alt/title into image file metadata:
+
+- JPEG: APP1 XMP + APP13 IPTC IIM
+- PNG: iTXt chunks + XMP standard chunk
+- WebP: VP8X + EXIF + XMP chunks
+- SVG: `<metadata>` XMP RDF/XML + `<title>` + `<desc>`
+
+Integrated as Phase 3 loop in `localizeMarkdownImages` (after VLM captioning, before `savedImages` construction). Non-fatal. `ingest.ts` log gains `meta-embed` counter.
+
+## Open review items (not yet addressed)
+
+- **H2:** `localizeMarkdownImages` defaults to `true` in `wiki-store.ts:609` — product decision needed on whether to default `false` or add first-run prompt.
+- **M3:** caption cache batch write vs URL cache per-entry write inconsistency.
+- **M4:** `classifyImageUrl` could return parsed result to avoid duplicate `resolveLocalRelative`.
+- **M5:** `readBodyWithLimit` fallback buffers fully before size check.
+- **M6:** no integration-layer unit tests for `ingest.ts` Step 0.4 hook.
 
 ## Non-goals (Phase 2 / 3)
 

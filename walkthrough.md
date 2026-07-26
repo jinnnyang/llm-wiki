@@ -1,13 +1,70 @@
 ---
 kind: walkthrough
-last_updated: '2026-07-23T03:00:00+00:00'
-last_writer: take-over
-last_agent: hermes-agent
-session_id: session-2026-07-23-mdimg-review-2
-last_verified: '2026-07-23T03:00:00+00:00'
+last_updated: '2026-07-26T10:33:24+00:00'
+last_writer: hand-off
+last_agent: hermes-devops
+session_id: handoff-20260726
+last_verified: '2026-07-26T10:33:10+00:00'
 ---
 
 # Walkthrough — llm-wiki
+
+## 2026-07-26 — Code review fixes + Phase 3 metadata embedding
+
+<!-- keep -->
+
+### Session arc
+
+1. **Code review of `feat/markdown-image-localizer` branch** — full review of the 10-commit, +4639/−23 line branch. Produced tiered findings: H1-H3 (high), M1-M6 (medium), L1-L6 (low).
+2. **Fixed H1/H3/M1/M2** (commit `2182625`):
+   - H1: `findImageSourcesBlockInYaml` used `split(/\r?\n/)` + `line.length + 1`, which undercounts by 1 byte per CRLF line. Fixed with a regex that captures the actual separator (`\r\n` vs `\n`) and adds its real length.
+   - H3: `fetchRemoteImage` composed timeout + caller signals via `AbortSignal.any`, but silently dropped the caller signal when `AbortSignal.any` is unavailable (older runtimes). Fixed with a manual `AbortController` + dual `abort` listener composition.
+   - M1: deleted duplicate `sha256OfBytesFull` (identical to `sha256Hex`). Kept `sha8OfBytes` export because tests import it directly.
+   - M2: three handlers (`handleRemoteHttp`, `handleDataUri`, `handleLocalRelative`) each called `crypto.subtle.digest` twice (once for sha8, once for full sha256). Unified to single `sha256Hex` + `slice(0, 8)`.
+3. **User requested metadata embedding feature** — write VLM-generated alt/title into the image file's own metadata after download + captioning. Constraints: no RAW/BMP/GIF; multi-vendor field duplication for compatibility.
+4. **Implemented `src/lib/image-metadata-embed.ts`** (710 lines, pure byte manipulation, zero external deps):
+   - JPEG: APP1 XMP (`dc:description`, `dc:title`, `Iptc4xmpExt:AltTextAccessibility`) + APP13 IPTC IIM (`Caption-Abstract`, `Headline` via 8BIM wrapper).
+   - PNG: iTXt chunks (`Description`, `Title`, `AltTextAccessibility`) + standard XMP chunk (`XML:com.adobe.xmp`). Full UTF-8 — no Latin-1 `tEXt`.
+   - WebP: auto-synthesized/updated VP8X flags + EXIF chunk (TIFF `ImageDescription` + `UserComment` UNICODE) + XMP chunk.
+   - SVG: `<metadata>` with XMP RDF/XML + `<title>` + `<desc>` elements.
+   - All formats: idempotent (strips existing metadata blocks before inserting new ones).
+5. **15 unit tests** (`image-metadata-embed.test.ts`) covering all 4 formats, Chinese text, idempotency, unsupported formats, I/O error isolation.
+6. **Phase 3 integration** into `localizeMarkdownImages`: loop after VLM captioning, only for `captioned`/`cache-hit` images. Non-fatal — failures count in `stats.metadataSkipped`. `ingest.ts` log gains `meta-embed` counter.
+7. **Committed as two separate commits** per user request:
+   - `2182625` — review fixes (H1/H3/M1/M2)
+   - `3cda623` — Phase 3 metadata embedding (4 files, +1181/−1)
+8. **Verification:** `npx tsc --noEmit` clean. 4 test files, 158/158 tests passing (143 pre-existing + 15 new).
+
+### Files touched this session
+
+Committed:
+
+```
+2182625 fix(localizer): code review fixes
+  src/lib/markdown-image-localizer.ts
+
+3cda623 feat(localizer): Phase 3 — embed VLM alt/title into image file metadata
+  src/lib/image-metadata-embed.ts       (new, 710 lines)
+  src/lib/image-metadata-embed.test.ts  (new, 436 lines)
+  src/lib/markdown-image-localizer.ts   (Phase 3 integration)
+  src/lib/ingest.ts                     (log counter)
+```
+
+Working tree still carries pre-existing `M package-lock.json` and untracked `CLAUDE.md`.
+
+### Key decisions
+
+- Metadata embedding is Phase 3 of the localizer pipeline (after Phase 1 download, Phase 2 VLM caption).
+- Only `captioned` and `cache-hit` images get metadata — `already-localized` and failed images are skipped.
+- Non-fatal by design: `embedImageMetadata` catches all errors internally, returns `{ written: false }`.
+- `sha8OfBytes` export preserved despite internal dedup — tests import it directly.
+- H2 (default `true` for `localizeMarkdownImages`) left as open product decision.
+
+### Open items for next session
+
+- H2: product decision on `localizeMarkdownImages` default value.
+- M3-M6: medium-priority review items (see task.md "Open review items").
+- Settings UI for new config fields (Phase 3 non-goal).
 
 ## 2026-07-23 (afternoon) — Plan v3: respect existing alt/title + review-round-2 fixes
 
