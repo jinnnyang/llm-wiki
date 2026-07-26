@@ -92,6 +92,14 @@ export interface LocalizeResult {
   rewrittenWikiMarkdown: string
   /** Localized image metadata for `injectImagesIntoSourceSummary`. */
   savedImages: SavedImage[]
+  /**
+   * Frontmatter `image_sources:` mapping for THIS run. Populated per §11:
+   * one entry per remote-http OR data-uri image. Local-relative and
+   * already-localized refs are excluded. Data-URI values are already
+   * truncated via {@link truncateDataUriForFrontmatter}. The caller
+   * passes this straight to {@link mergeImageSourcesFrontmatter}.
+   */
+  frontmatterEntries: FrontmatterImageEntry[]
   stats: {
     // I/O
     downloaded: number
@@ -1443,6 +1451,7 @@ export async function localizeMarkdownImages(
       rewrittenSourceMarkdown: markdown,
       rewrittenWikiMarkdown: markdown,
       savedImages: [],
+      frontmatterEntries: [],
       stats,
     }
   }
@@ -1756,10 +1765,27 @@ export async function localizeMarkdownImages(
   const rewrittenSourceMarkdown = rewriteBySlot(markdown, slots, "source")
   const rewrittenWikiMarkdown = rewriteBySlot(markdown, slots, "wiki")
 
+  // §11 frontmatter mapping: only remote-http + data-uri qualify.
+  // Data-URI values are truncated to keep the frontmatter block readable.
+  const frontmatterEntries: FrontmatterImageEntry[] = localized
+    .filter(
+      (li) =>
+        (li.origin === "remote-http" || li.origin === "data-uri") &&
+        li.originalUrl !== undefined,
+    )
+    .map((li) => ({
+      localPath: li.relPath,
+      source:
+        li.origin === "data-uri"
+          ? truncateDataUriForFrontmatter(li.originalUrl!)
+          : li.originalUrl!,
+    }))
+
   return {
     rewrittenSourceMarkdown,
     rewrittenWikiMarkdown,
     savedImages,
+    frontmatterEntries,
     stats,
   }
 }
