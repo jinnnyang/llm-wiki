@@ -34,9 +34,11 @@ import {
   readFile,
   writeFile,
   writeFileBase64,
+  readFileAsBase64,
 } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
 import { isInsideProject } from "@/lib/markdown-image-resolver"
+import { captionImage } from "@/lib/vision-caption"
 import {
   fetchImportUrl,
   isPrivateNetworkHost,
@@ -935,6 +937,212 @@ export function rewriteBySlot(
 }
 
 // ---------------------------------------------------------------------------
+// Caption cache (Commit 4b) — writer-side helpers over `.llm-wiki/image-caption-cache.json`
+// ---------------------------------------------------------------------------
+//
+// `image-caption-pipeline.ts` owns the schema (`CaptionEntry`) and the
+// reader used by the source-summary safety net (`loadCaptionCache`), but
+// its writer helpers are module-private. Rather than widen its public
+// surface, the localizer keeps its own read/write over the same file
+// path — a documented multi-writer arrangement:
+//
+//   - Both writers use `SHA-256 of image bytes` as the key.
+//   - When both write the same key, last-writer-wins is acceptable:
+//     they run in different lifecycles (image-caption-pipeline captions
+//     images embedded in the SOURCE by the previous ingestion stage;
+//     the localizer captions IMAGES INSIDE THE MARKDOWN BODY discovered
+//     at Step 0.4). A caption written by either is content-appropriate
+//     for the same bytes.
+//   - The schema field additions here (`title`, `originalUrl`) are
+//     documented in `image-caption-pipeline.ts` as optional; reading
+//     back an entry the localizer wrote is safe from either side.
+
+const CAPTION_CACHE_REL_PATH = ".llm-wiki/image-caption-cache.json"
+
+/**
+ * Persisted per-image caption entry. Mirrors
+ * `image-caption-pipeline.ts:CaptionEntry` — kept in sync manually
+ * because that type is module-private.
+ */
+interface CaptionCacheEntry {
+  caption: string
+  mimeType: string
+  model: string
+  capturedAt: string
+  title?: string
+  originalUrl?: string
+}
+
+type CaptionCache = Record<string /* sha256 of bytes */, CaptionCacheEntry>
+
+async function readCaptionCache(projectPath: string): Promise<CaptionCache> {
+  const cachePath = `${normalizePath(projectPath)}/${CAPTION_CACHE_REL_PATH}`
+  if (!(await fileExists(cachePath))) return {}
+  try {
+    const raw = await readFile(cachePath)
+    const parsed = JSON.parse(raw) as unknown
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as CaptionCache
+    }
+  } catch (err) {
+    console.warn(
+      `[localizer] Corrupt caption cache at ${cachePath}, starting empty:`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+  return {}
+}
+
+async function writeCaptionCache(
+  projectPath: string,
+  cache: CaptionCache,
+): Promise<void> {
+  const pp = normalizePath(projectPath)
+  await createDirectory(`${pp}/.llm-wiki`)
+  await writeFile(`${pp}/${CAPTION_CACHE_REL_PATH}`, JSON.stringify(cache, null, 2))
+}
+
+// ---------------------------------------------------------------------------
+// VLM decision matrix (§1) — Commit 4b
+// ---------------------------------------------------------------------------
+
+/**
+ * Which per-image outcome the decision matrix landed on. Drives the
+ * per-image stat counter increment. `captioned` and `cache-hit` both
+ * mean the ref gets alt+title from VLM (fresh call vs cached call);
+ * `captioned` also counts a network call.
+ */
+type VlmOutcome =
+  | "captioned"
+  | "cache-hit"
+  | "skipped-author-alt"
+  | "skipped-too-small"
+  | "skipped-no-vlm-provider"
+  | "skipped-already-localized"
+  | "failed"
+
+/**
+ * Whitespace-only alt is treated as empty per §1 (test case 9).
+ * `"image"` (single generic word) is treated as non-empty per test 10.
+ */
+function isAltEmpty(alt: string): boolean {
+  return alt.trim().length === 0
+}
+
+/**
+ * Default `probeImageDimensions` implementation for production callers
+ * (Tauri webview). Uses `createImageBitmap`, which understands PNG /
+ * JPEG / WebP / GIF and returns SVG at its rasterized bounds.
+ *
+ * Returns `{ width: 0, height: 0 }` on decode failure — the caller
+ * (`decideVlmOutcome`) treats zero dimensions as "unknown, run VLM"
+ * per §2 ("SVG or decode failure → treated as over threshold").
+ */
+async function defaultProbeImageDimensions(
+  mimeType: string,
+  bytes: Uint8Array,
+): Promise<{ width: number; height: number }> {
+  // SVG can't go through createImageBitmap reliably across all
+  // Chromium versions; treat as unknown.
+  if (mimeType === "image/svg+xml") return { width: 0, height: 0 }
+  try {
+    // Node/jsdom test paths inject their own probe so this branch is
+    // only exercised in the Tauri webview.
+    if (typeof createImageBitmap !== "function") {
+      return { width: 0, height: 0 }
+    }
+    const buf = bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength,
+    ) as ArrayBuffer
+    const blob = new Blob([buf], { type: mimeType })
+    const bmp = await createImageBitmap(blob)
+    const out = { width: bmp.width, height: bmp.height }
+    bmp.close()
+    return out
+  } catch {
+    return { width: 0, height: 0 }
+  }
+}
+
+/**
+ * Extract full SHA-256 for a bytes buffer. Same helper as the private
+ * `sha256OfBytesFull` at the bottom of this file — kept together with
+ * the caption logic for readability at the caller site.
+ */
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const buf = bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer
+  const digest = await crypto.subtle.digest("SHA-256", buf)
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+}
+
+/**
+ * Split a VLM caption into `{ alt, title }`. Contract with the caption
+ * prompt (see `vision-caption.ts:CAPTION_PROMPT`): the caption is one
+ * line ≤ 100 chars. If the model returns multiple lines, first line
+ * becomes `alt` and the rest joined with " " becomes `title`. Single
+ * line: alt = caption, title = undefined (the author had no title
+ * either; empty-alt-empty-title stays that way for tiny images, but
+ * for captionable images we still emit alt).
+ *
+ * The alt/title returned here go through `formatImageAlt` /
+ * `formatImageTitle` in `rewriteBySlot` — this function does NOT do
+ * the §7 escape/sanitize. It only splits.
+ */
+function splitCaptionIntoAltAndTitle(
+  caption: string,
+): { alt: string; title: string | undefined } {
+  const trimmed = caption.trim()
+  if (trimmed.length === 0) return { alt: "", title: undefined }
+  const lines = trimmed.split(/\r?\n/).filter((l) => l.trim().length > 0)
+  if (lines.length <= 1) {
+    return { alt: trimmed, title: undefined }
+  }
+  return {
+    alt: lines[0].trim(),
+    title: lines.slice(1).map((l) => l.trim()).join(" "),
+  }
+}
+
+/**
+ * Minimal p-limit-style concurrency limiter — private to this module
+ * so we don't pull `p-limit` into the dep tree just for this. Preserves
+ * order of resolution matching order of the input array (unlike
+ * `Promise.all` with `Promise.race`-based reordering).
+ */
+function pLimit<T>(
+  concurrency: number,
+): (fn: () => Promise<T>) => Promise<T> {
+  const cap = Math.max(1, Math.floor(concurrency))
+  let active = 0
+  const queue: Array<() => void> = []
+  const next = () => {
+    if (active >= cap) return
+    const runner = queue.shift()
+    if (runner) runner()
+  }
+  return (fn: () => Promise<T>) =>
+    new Promise<T>((resolve, reject) => {
+      const runner = () => {
+        active += 1
+        fn()
+          .then(resolve, reject)
+          .finally(() => {
+            active -= 1
+            next()
+          })
+      }
+      queue.push(runner)
+      next()
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Public entry — main pipeline (Commit 3c; no VLM, no body rewrite)
 // ---------------------------------------------------------------------------
 
@@ -945,6 +1153,8 @@ export function rewriteBySlot(
 interface LocalizedImage {
   ref: ImageRef
   sha8: string
+  /** Full SHA-256 hex, used as caption cache key. Empty for `already-localized`. */
+  sha256: string
   mimeType: string
   width: number
   height: number
@@ -958,20 +1168,33 @@ interface LocalizedImage {
   bytesLen: number
   /** Which classification path produced this image. */
   origin: "remote-http" | "data-uri" | "local-relative" | "already-localized"
+  /**
+   * Base64-encoded bytes captured during Step-1 I/O, retained ONLY when
+   * the ref is captionable (empty author alt + captionable classification).
+   * Reused for `captionImage`. `undefined` when we don't intend to caption
+   * this image (author alt non-empty, provider gate closed, etc.) so we
+   * don't hold big buffers alive for nothing.
+   */
+  base64ForCaption: string | undefined
+  /** Final alt to emit — starts as ref.alt; VLM overwrites when applicable. */
+  finalAlt: string
+  /** Final title to emit — starts as ref.title; VLM overwrites when applicable. */
+  finalTitle: string | undefined
+  /**
+   * Which decision matrix cell this ended up in. Written by the
+   * decision-matrix pass so the stats-increment step doesn't have to
+   * re-derive from the state.
+   */
+  vlmOutcome: VlmOutcome
 }
 
 /**
  * Main entry: for every `![alt](url ...)` reference in `opts.markdown`,
  * resolve/download/copy the bytes into `wiki/media/<slug>/`, dedup
- * by content SHA, update the URL cache, and produce `SavedImage[]`
- * plus a `stats` summary.
- *
- * COMMIT 3c LIMITATION: VLM captioning is not wired in (Commit 4).
- * Body rewriting via `rewriteBySlot` and frontmatter merge via
- * `mergeImageSourcesFrontmatter` are also Commit 4 territory, so the
- * `rewrittenSourceMarkdown` and `rewrittenWikiMarkdown` fields come
- * back as empty strings. Everything else — I/O, caching, stats,
- * `savedImages` — is production-quality.
+ * by content SHA, update the URL cache, run the v3 decision matrix
+ * (author-alt / provider gate / size threshold) to decide whether
+ * to call the VLM, and emit two rewritten forms of the body plus
+ * `SavedImage[]` and a `stats` summary.
  */
 export async function localizeMarkdownImages(
   opts: LocalizeOptions,
@@ -981,8 +1204,11 @@ export async function localizeMarkdownImages(
     sourcePath,
     sourceSummarySlug,
     markdown,
+    llmConfig,
     multimodalConfig,
     signal,
+    onProgress,
+    probeImageDimensions,
   } = opts
 
   const pp = normalizePath(projectPath)
@@ -992,9 +1218,14 @@ export async function localizeMarkdownImages(
   const timeoutMs =
     multimodalConfig.imageFetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS
   const ttlDays = multimodalConfig.urlCacheTtlDays ?? 45
+  const minPixel = multimodalConfig.minImagePixelSize ?? 100
+  const concurrency = multimodalConfig.concurrency ?? 4
+  const probe = probeImageDimensions ?? defaultProbeImageDimensions
+
+  // §1 Provider capability gate — evaluated ONCE, up front.
+  const canRunVlm = llmConfig?.provider !== "codex-cli"
 
   const refs = findImageReferencesWithTitle(markdown)
-  const localized: LocalizedImage[] = []
   const stats: LocalizeResult["stats"] = {
     downloaded: 0,
     urlCacheHits: 0,
@@ -1025,126 +1256,276 @@ export async function localizeMarkdownImages(
   // survive interleaved runs (§3.2 concurrency note).
   const urlCache = await readUrlCache(projectPath)
 
-  for (const ref of refs) {
-    if (signal?.aborted) break
-    try {
-      const cls = await classifyImageUrl(ref.url, sourceDir, projectPath)
-      switch (cls) {
-        case "already-localized": {
-          stats.alreadyLocalized += 1
-          const { absPath } = resolveLocalRelative(
-            ref.url,
-            sourceDir,
-            projectPath,
-          )
-          const relPath = absPath.startsWith(pp + "/")
-            ? absPath.slice(pp.length + 1)
-            : absPath
-          // Preserve the reference by recording it in `savedImages`
-          // with `sha256`/`sha8` unknown — the file is already on disk
-          // and we don't re-read it. Commit 4's rewriter can decide
-          // whether to leave the ref untouched or re-emit.
-          localized.push({
-            ref,
-            sha8: "",
-            mimeType: "",
-            width: 0,
-            height: 0,
-            absPath,
-            relPath,
-            originalUrl: undefined,
-            bytesLen: 0,
-            origin: "already-localized",
-          })
-          break
+  // -------------------------------------------------------------------
+  // Phase 1: I/O — classify + fetch/copy/decode. Concurrency-bounded.
+  // -------------------------------------------------------------------
+  const limit = pLimit<LocalizedImage | null>(concurrency)
+  const phase1Total = refs.length
+  let phase1Done = 0
+
+  const phase1Tasks = refs.map((ref) =>
+    limit(async (): Promise<LocalizedImage | null> => {
+      if (signal?.aborted) return null
+      try {
+        const cls = await classifyImageUrl(ref.url, sourceDir, projectPath)
+        switch (cls) {
+          case "already-localized": {
+            stats.alreadyLocalized += 1
+            const { absPath } = resolveLocalRelative(
+              ref.url,
+              sourceDir,
+              projectPath,
+            )
+            const relPath = absPath.startsWith(pp + "/")
+              ? absPath.slice(pp.length + 1)
+              : absPath
+            return {
+              ref,
+              sha8: "",
+              sha256: "",
+              mimeType: "",
+              width: 0,
+              height: 0,
+              absPath,
+              relPath,
+              originalUrl: undefined,
+              bytesLen: 0,
+              origin: "already-localized",
+              base64ForCaption: undefined,
+              finalAlt: ref.alt,
+              finalTitle: ref.title,
+              vlmOutcome: "skipped-already-localized",
+            }
+          }
+          case "remote-http": {
+            const result = await handleRemoteHttp(ref.url, {
+              projectPath,
+              pp,
+              mediaDir,
+              sourceSummarySlug,
+              urlCache,
+              ttlDays,
+              timeoutMs,
+              now,
+              signal,
+            })
+            if (result.cacheHit) stats.urlCacheHits += 1
+            else stats.downloaded += 1
+            return {
+              ref,
+              sha8: result.sha8,
+              sha256: result.sha256,
+              mimeType: result.mimeType,
+              width: result.width,
+              height: result.height,
+              absPath: result.absPath,
+              relPath: result.relPath,
+              originalUrl: ref.url,
+              bytesLen: result.bytesLen,
+              origin: "remote-http",
+              // Only retain base64 when the ref is a caption candidate.
+              base64ForCaption:
+                canRunVlm && isAltEmpty(ref.alt) && result.bytesB64
+                  ? result.bytesB64
+                  : undefined,
+              finalAlt: ref.alt,
+              finalTitle: ref.title,
+              vlmOutcome: "failed", // Phase 2 overwrites
+            }
+          }
+          case "data-uri": {
+            const result = await handleDataUri(ref.url, {
+              mediaDir,
+              pp,
+            })
+            stats.decoded += 1
+            return {
+              ref,
+              sha8: result.sha8,
+              sha256: result.sha256,
+              mimeType: result.mimeType,
+              width: 0,
+              height: 0,
+              absPath: result.absPath,
+              relPath: result.relPath,
+              originalUrl: ref.url,
+              bytesLen: result.bytesLen,
+              origin: "data-uri",
+              base64ForCaption:
+                canRunVlm && isAltEmpty(ref.alt) ? result.bytesB64 : undefined,
+              finalAlt: ref.alt,
+              finalTitle: ref.title,
+              vlmOutcome: "failed",
+            }
+          }
+          case "local-relative": {
+            const result = await handleLocalRelative(ref.url, {
+              sourceDir,
+              projectPath,
+              mediaDir,
+              pp,
+            })
+            stats.copied += 1
+            return {
+              ref,
+              sha8: result.sha8,
+              sha256: result.sha256,
+              mimeType: result.mimeType,
+              width: 0,
+              height: 0,
+              absPath: result.absPath,
+              relPath: result.relPath,
+              originalUrl: undefined,
+              bytesLen: result.bytesLen,
+              origin: "local-relative",
+              base64ForCaption:
+                canRunVlm && isAltEmpty(ref.alt) ? result.bytesB64 : undefined,
+              finalAlt: ref.alt,
+              finalTitle: ref.title,
+              vlmOutcome: "failed",
+            }
+          }
+          case "unsupported":
+          case "failed":
+          default: {
+            stats.failed += 1
+            console.warn(
+              `[localizer] Skipping image (${cls}): ${ref.url.slice(0, 120)}`,
+            )
+            return null
+          }
         }
-        case "remote-http": {
-          const result = await handleRemoteHttp(ref.url, {
-            projectPath,
-            pp,
-            mediaDir,
-            sourceSummarySlug,
-            urlCache,
-            ttlDays,
-            timeoutMs,
-            now,
-            signal,
-          })
-          if (result.cacheHit) stats.urlCacheHits += 1
-          else stats.downloaded += 1
-          localized.push({
-            ref,
-            sha8: result.sha8,
-            mimeType: result.mimeType,
-            width: result.width,
-            height: result.height,
-            absPath: result.absPath,
-            relPath: result.relPath,
-            originalUrl: ref.url,
-            bytesLen: result.bytesLen,
-            origin: "remote-http",
-          })
-          break
-        }
-        case "data-uri": {
-          const result = await handleDataUri(ref.url, {
-            mediaDir,
-            pp,
-          })
-          stats.decoded += 1
-          localized.push({
-            ref,
-            sha8: result.sha8,
-            mimeType: result.mimeType,
-            width: 0,
-            height: 0,
-            absPath: result.absPath,
-            relPath: result.relPath,
-            originalUrl: ref.url,
-            bytesLen: result.bytesLen,
-            origin: "data-uri",
-          })
-          break
-        }
-        case "local-relative": {
-          const result = await handleLocalRelative(ref.url, {
-            sourceDir,
-            projectPath,
-            mediaDir,
-            pp,
-          })
-          stats.copied += 1
-          localized.push({
-            ref,
-            sha8: result.sha8,
-            mimeType: result.mimeType,
-            width: 0,
-            height: 0,
-            absPath: result.absPath,
-            relPath: result.relPath,
-            originalUrl: undefined,
-            bytesLen: result.bytesLen,
-            origin: "local-relative",
-          })
-          break
-        }
-        case "unsupported":
-        case "failed":
-        default: {
-          stats.failed += 1
-          console.warn(
-            `[localizer] Skipping image (${cls}): ${ref.url.slice(0, 120)}`,
-          )
-          break
-        }
+      } catch (err) {
+        stats.failed += 1
+        console.warn(
+          `[localizer] Failed to localize ${ref.url.slice(0, 120)}: `,
+          err instanceof Error ? err.message : err,
+        )
+        return null
+      } finally {
+        phase1Done += 1
+        onProgress?.(phase1Done, phase1Total, "download")
       }
+    }),
+  )
+
+  const phase1Results = await Promise.all(phase1Tasks)
+  const localized: LocalizedImage[] = phase1Results.filter(
+    (li): li is LocalizedImage => li !== null,
+  )
+
+  // -------------------------------------------------------------------
+  // Phase 2: VLM decision matrix — per §1 + §2. Runs serially by design:
+  // caption-cache updates read-modify-write the same JSON file, and
+  // captionImage is already IO-bound (network + LLM), so per-image
+  // concurrency doesn't help meaningfully. Provider gate closes the
+  // entire phase early.
+  // -------------------------------------------------------------------
+  const captionCache: CaptionCache = await readCaptionCache(projectPath)
+  let captionCacheDirty = false
+  const captionTotal = localized.filter(
+    (li) => li.base64ForCaption !== undefined,
+  ).length
+  let captionDone = 0
+
+  for (const li of localized) {
+    if (signal?.aborted) break
+    // Already-localized refs bypass every axis.
+    if (li.origin === "already-localized") {
+      li.vlmOutcome = "skipped-already-localized"
+      continue
+    }
+    // Axis B: author alt non-empty → skip VLM, preserve verbatim.
+    if (!isAltEmpty(li.ref.alt)) {
+      stats.skippedAuthorAlt += 1
+      li.vlmOutcome = "skipped-author-alt"
+      continue
+    }
+    // §1 Provider gate: closed → skip VLM for every empty-alt image
+    // in the batch. I/O already ran; alt/title stay verbatim (empty).
+    if (!canRunVlm) {
+      stats.skippedNoVlmProvider += 1
+      li.vlmOutcome = "skipped-no-vlm-provider"
+      continue
+    }
+    // §3.1 Caption cache: keyed by full SHA-256 of image bytes.
+    // Same image ref'd in N places → 1 VLM call across the whole
+    // project's history.
+    const cached = captionCache[li.sha256]
+    if (cached && cached.caption.trim().length > 0) {
+      stats.captionCacheHits += 1
+      const split = splitCaptionIntoAltAndTitle(cached.caption)
+      li.finalAlt = split.alt
+      li.finalTitle = cached.title ?? split.title ?? li.ref.title
+      li.vlmOutcome = "cache-hit"
+      continue
+    }
+    // §2 Threshold: probe dimensions, skip if under threshold on EITHER
+    // axis. Unknown dims (probe returned 0) → treat as over threshold
+    // so we don't miss real charts on decode failure.
+    let dims = { width: li.width, height: li.height }
+    if (li.base64ForCaption && (dims.width === 0 || dims.height === 0)) {
+      // Decode base64 → bytes for the probe. Skip probe on empty base64.
+      const b = atob(li.base64ForCaption)
+      const bytes = new Uint8Array(b.length)
+      for (let i = 0; i < b.length; i++) bytes[i] = b.charCodeAt(i)
+      dims = await probe(li.mimeType, bytes)
+      li.width = dims.width
+      li.height = dims.height
+    }
+    const knownDims = dims.width > 0 && dims.height > 0
+    if (knownDims && (dims.width < minPixel || dims.height < minPixel)) {
+      stats.skippedTooSmall += 1
+      li.vlmOutcome = "skipped-too-small"
+      continue
+    }
+    // §1 Axis B empty alt + captionable → call VLM.
+    if (!li.base64ForCaption) {
+      // Defensive: this branch should only be reached for empty-alt
+      // captionable refs, which retained bytes in phase 1. If bytes
+      // were dropped (e.g. URL cache hit path with no re-read), fall
+      // through to "leave alt empty" without failing the whole batch.
+      li.vlmOutcome = "skipped-too-small"
+      stats.skippedTooSmall += 1
+      continue
+    }
+    try {
+      const caption = await captionImage(
+        li.base64ForCaption,
+        li.mimeType,
+        llmConfig,
+        signal,
+      )
+      stats.captioned += 1
+      captionDone += 1
+      onProgress?.(captionDone, captionTotal, "caption")
+      const split = splitCaptionIntoAltAndTitle(caption)
+      li.finalAlt = split.alt
+      li.finalTitle = split.title ?? li.ref.title
+      li.vlmOutcome = "captioned"
+      captionCache[li.sha256] = {
+        caption,
+        mimeType: li.mimeType,
+        model: multimodalConfig.model ?? llmConfig.model ?? "unknown",
+        capturedAt: new Date().toISOString(),
+        title: split.title,
+        originalUrl: li.originalUrl,
+      }
+      captionCacheDirty = true
     } catch (err) {
-      stats.failed += 1
+      // Caption failure is isolated: this image keeps empty alt,
+      // batch continues. Not counted as `failed` (I/O succeeded);
+      // logged for diagnostics.
       console.warn(
-        `[localizer] Failed to localize ${ref.url.slice(0, 120)}: `,
+        `[localizer] Caption failed for ${li.ref.url.slice(0, 120)}: `,
         err instanceof Error ? err.message : err,
       )
+      li.vlmOutcome = "failed"
     }
+  }
+
+  if (captionCacheDirty) {
+    await writeCaptionCache(projectPath, captionCache)
   }
 
   const savedImages: SavedImage[] = localized
@@ -1159,26 +1540,20 @@ export async function localizeMarkdownImages(
         ? li.relPath.slice("wiki/".length)
         : li.relPath,
       absPath: li.absPath,
-      sha256: li.sha8, // sha8 stored here — Commit 4 upgrades to full SHA-256
+      sha256: li.sha256 || li.sha8,
     }))
 
-  // Build rewrite slots (§4a). At this commit we take alt/title
-  // verbatim from `ref.alt` / `ref.title`. Commit 4b's decision matrix
-  // will overwrite alt/title with VLM output when Axis B allows.
-  //
-  // `already-localized` refs are intentionally skipped: their author-
-  // written reference already points at the correct local file, and the
-  // §5 fall-through contract says we do not touch them. If we DID rewrite
-  // them we'd risk mangling a hand-crafted relative path that already
-  // matches the target `pathForm`.
+  // Build rewrite slots from the FINAL alt/title values set by the
+  // decision matrix. `already-localized` refs are intentionally
+  // skipped — see the §5 fall-through contract in the module header.
   const slots: RewriteSlot[] = localized
     .filter((li) => li.origin !== "already-localized")
     .map((li) => ({
       offset: li.ref.offset,
       length: li.ref.length,
       canonicalRelPath: li.relPath,
-      alt: li.ref.alt,
-      title: li.ref.title,
+      alt: li.finalAlt,
+      title: li.finalTitle,
     }))
   const rewrittenSourceMarkdown = rewriteBySlot(markdown, slots, "source")
   const rewrittenWikiMarkdown = rewriteBySlot(markdown, slots, "wiki")
@@ -1212,6 +1587,7 @@ async function handleRemoteHttp(
   ctx: RemoteContext,
 ): Promise<{
   sha8: string
+  sha256: string
   mimeType: string
   width: number
   height: number
@@ -1219,6 +1595,8 @@ async function handleRemoteHttp(
   relPath: string
   bytesLen: number
   cacheHit: boolean
+  /** Base64-encoded bytes for VLM. `undefined` on URL cache hit (bytes not re-read). */
+  bytesB64: string | undefined
 }> {
   const cached = ctx.urlCache[url]
   if (cached && isUrlCacheEntryFresh(cached, ctx.ttlDays, ctx.now)) {
@@ -1229,6 +1607,7 @@ async function handleRemoteHttp(
     if (await fileExists(canonicalAbs)) {
       return {
         sha8: cached.sha256.slice(0, 8),
+        sha256: cached.sha256,
         mimeType: cached.mimeType,
         width: cached.width,
         height: cached.height,
@@ -1236,6 +1615,7 @@ async function handleRemoteHttp(
         relPath: cached.canonicalRelPath,
         bytesLen: cached.bytesLen,
         cacheHit: true,
+        bytesB64: undefined,
       }
     }
   }
@@ -1279,6 +1659,7 @@ async function handleRemoteHttp(
 
   return {
     sha8,
+    sha256: fullSha256,
     mimeType,
     width: 0,
     height: 0,
@@ -1286,6 +1667,7 @@ async function handleRemoteHttp(
     relPath,
     bytesLen: bytes.byteLength,
     cacheHit: false,
+    bytesB64: bytesToBase64(bytes),
   }
 }
 
@@ -1299,13 +1681,16 @@ async function handleDataUri(
   ctx: DataUriContext,
 ): Promise<{
   sha8: string
+  sha256: string
   mimeType: string
   absPath: string
   relPath: string
   bytesLen: number
+  bytesB64: string
 }> {
   const { bytes, mimeType } = resolveDataUri(dataUri)
   const sha8 = await sha8OfBytes(bytes)
+  const sha256 = await sha256Hex(bytes)
   const ext = extFromMime(mimeType)
   const fileName = `inline-${sha8}.${ext}`
   const absPath = `${ctx.mediaDir}/${fileName}`
@@ -1315,7 +1700,15 @@ async function handleDataUri(
   if (!(await fileExists(absPath))) {
     await writeFileBase64(absPath, bytesToBase64(bytes))
   }
-  return { sha8, mimeType, absPath, relPath, bytesLen: bytes.byteLength }
+  return {
+    sha8,
+    sha256,
+    mimeType,
+    absPath,
+    relPath,
+    bytesLen: bytes.byteLength,
+    bytesB64: bytesToBase64(bytes),
+  }
 }
 
 interface LocalRelativeContext {
@@ -1330,10 +1723,12 @@ async function handleLocalRelative(
   ctx: LocalRelativeContext,
 ): Promise<{
   sha8: string
+  sha256: string
   mimeType: string
   absPath: string
   relPath: string
   bytesLen: number
+  bytesB64: string
 }> {
   const { absPath: srcAbs } = resolveLocalRelative(
     url,
@@ -1344,7 +1739,6 @@ async function handleLocalRelative(
   // base64 command so we get raw bytes back through a text-safe channel.
   // The command also returns the Rust-side MIME guess, which is more
   // accurate than sniffing the extension.
-  const { readFileAsBase64 } = await import("@/commands/fs")
   const { base64: b64, mimeType: probedMime } = await readFileAsBase64(srcAbs)
   const binary = atob(b64)
   const bytes = new Uint8Array(binary.length)
@@ -1355,6 +1749,7 @@ async function handleLocalRelative(
     )
   }
   const sha8 = await sha8OfBytes(bytes)
+  const sha256 = await sha256Hex(bytes)
   const mimeType = probedMime && probedMime.startsWith(IMAGE_MIME_PREFIX)
     ? probedMime
     : extToMime(
@@ -1372,10 +1767,12 @@ async function handleLocalRelative(
   }
   return {
     sha8,
+    sha256,
     mimeType,
     absPath,
     relPath,
     bytesLen: bytes.byteLength,
+    bytesB64: b64,
   }
 }
 

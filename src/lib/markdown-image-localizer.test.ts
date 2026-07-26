@@ -13,6 +13,12 @@ vi.mock("@/commands/fs", () => ({
   readFileAsBase64: vi.fn(),
 }))
 
+// Mock captionImage so Phase-2 VLM tests can stub responses without
+// hitting a real provider. Individual tests re-configure `mockImplementation`.
+vi.mock("@/lib/vision-caption", () => ({
+  captionImage: vi.fn(),
+}))
+
 import {
   MD_IMAGE_RE_WITH_TITLE,
   findImageReferencesWithTitle,
@@ -46,6 +52,7 @@ import {
   copyFile,
   readFileAsBase64,
 } from "@/commands/fs"
+import { captionImage } from "@/lib/vision-caption"
 
 const mockFileExists = vi.mocked(fileExists)
 const mockReadFile = vi.mocked(readFile)
@@ -54,6 +61,7 @@ const mockCreateDirectory = vi.mocked(createDirectory)
 const mockWriteFileBase64 = vi.mocked(writeFileBase64)
 const mockCopyFile = vi.mocked(copyFile)
 const mockReadFileAsBase64 = vi.mocked(readFileAsBase64)
+const mockCaptionImage = vi.mocked(captionImage)
 
 beforeEach(() => {
   mockFileExists.mockReset()
@@ -63,10 +71,14 @@ beforeEach(() => {
   mockWriteFileBase64.mockReset()
   mockCopyFile.mockReset()
   mockReadFileAsBase64.mockReset()
+  mockCaptionImage.mockReset()
   mockWriteFile.mockResolvedValue(undefined as unknown as void)
   mockCreateDirectory.mockResolvedValue(undefined as unknown as void)
   mockWriteFileBase64.mockResolvedValue(undefined as unknown as void)
   mockCopyFile.mockResolvedValue(undefined as unknown as void)
+  // Default: reject VLM calls with a distinct sentinel so tests that
+  // accidentally invoke it fail loudly. Individual VLM tests override.
+  mockCaptionImage.mockRejectedValue(new Error("captionImage not mocked"))
 })
 
 // ---------------------------------------------------------------------------
@@ -822,15 +834,27 @@ function makeOpts(overrides: Partial<LocalizeOptions> = {}): LocalizeOptions {
     sourcePath: "/project/raw/sources/notes.md",
     sourceSummarySlug: "notes",
     markdown: "",
-    llmConfig: {} as LocalizeOptions["llmConfig"],
+    // Default provider is VLM-capable so canRunVlm=true. Tests that
+    // want the codex-cli gate override this.
+    llmConfig: {
+      provider: "openai",
+      apiKey: "test-key",
+      model: "gpt-4o",
+    } as unknown as LocalizeOptions["llmConfig"],
     multimodalConfig: {
       concurrency: 4,
-      captionModel: "test-model",
+      model: "test-model",
       minImagePixelSize: 64,
       imageFetchTimeoutMs: 5_000,
       urlCacheTtlDays: 45,
       localizeMarkdownImages: true,
     } as unknown as LocalizeOptions["multimodalConfig"],
+    // Default probe returns unknown dims (0,0) so §2 threshold treats
+    // as "over threshold → run VLM" — matches production Tauri probe
+    // behavior when the format isn't decodable. Tests that exercise
+    // the too-small branch override with a stub returning known small
+    // dims.
+    probeImageDimensions: async () => ({ width: 0, height: 0 }),
     ...overrides,
   }
 }
@@ -1434,5 +1458,474 @@ describe("localizeMarkdownImages — two-form body output (tests 31-34)", () => 
     expect(result.rewrittenSourceMarkdown).toBe(md)
     expect(result.rewrittenWikiMarkdown).toBe(md)
     expect(result.stats.alreadyLocalized).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Commit 4b — VLM decision matrix (§1) + provider gate + threshold + DI
+// ---------------------------------------------------------------------------
+//
+// Tests 3-10 sweep the 8-cell v3 decision matrix:
+//   Axis A (URL kind): remote / data-uri / local / already-localized  (rows)
+//   Axis B (author alt): empty vs non-empty  (columns)
+// The matrix reduces to a small set of outcomes:
+//   - alt empty + captionable + provider open + over threshold → VLM
+//   - alt empty + under threshold                              → skippedTooSmall
+//   - alt empty + codex-cli provider                           → skippedNoVlmProvider
+//   - alt non-empty (any URL kind)                             → skippedAuthorAlt
+//   - already-localized                                        → neither counter
+// Tests 24 (concurrency), 27 (failure isolation), 30 (provider gate) round out
+// the group. Additional tests cover caption-cache reuse and the sha256/probe
+// wiring — the mechanisms the decision matrix rides on.
+
+describe("localizeMarkdownImages — Commit 4b VLM decision matrix (§1)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  const remoteUrl = "https://example.com/chart.png"
+  const dataUri =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+
+  /**
+   * Common mock scaffold for VLM tests: URL cache absent, no on-disk
+   * canonical files, `readFile` returns empty JSON for both URL and
+   * caption caches.
+   */
+  function scaffoldEmptyCaches() {
+    mockFileExists.mockImplementation(async (p: string) => {
+      // No cache files, no pre-existing media files.
+      if (p.endsWith("image-url-cache.json")) return false
+      if (p.endsWith("image-caption-cache.json")) return false
+      return false
+    })
+    mockReadFile.mockResolvedValue("{}")
+  }
+
+  it("test 3 — remote + empty alt + provider open + over threshold → VLM called, finalAlt from caption", async () => {
+    scaffoldEmptyCaches()
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    stubFetch(async () =>
+      new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    )
+    mockCaptionImage.mockResolvedValue("A tidy line chart")
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: `![](${remoteUrl})`,
+        // Force over-threshold: probe returns > minPixel (64) on both axes.
+        probeImageDimensions: async () => ({ width: 800, height: 600 }),
+      }),
+    )
+
+    expect(mockCaptionImage).toHaveBeenCalledTimes(1)
+    expect(result.stats.captioned).toBe(1)
+    expect(result.stats.skippedAuthorAlt).toBe(0)
+    expect(result.stats.skippedTooSmall).toBe(0)
+    expect(result.stats.skippedNoVlmProvider).toBe(0)
+    // finalAlt threaded into rewritten body.
+    expect(result.rewrittenSourceMarkdown).toContain("![A tidy line chart](")
+  })
+
+  it("test 4 — remote + NON-empty alt → skippedAuthorAlt, no VLM call", async () => {
+    scaffoldEmptyCaches()
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    stubFetch(async () =>
+      new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    )
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: `![Author wrote this](${remoteUrl})`,
+      }),
+    )
+
+    expect(mockCaptionImage).not.toHaveBeenCalled()
+    expect(result.stats.captioned).toBe(0)
+    expect(result.stats.skippedAuthorAlt).toBe(1)
+    // Author alt survives verbatim into both forms.
+    expect(result.rewrittenSourceMarkdown).toContain("![Author wrote this](")
+    expect(result.rewrittenWikiMarkdown).toContain("![Author wrote this](")
+  })
+
+  it("test 5 — data-uri + empty alt + over threshold → VLM called on decoded bytes", async () => {
+    scaffoldEmptyCaches()
+    mockCaptionImage.mockResolvedValue("Inline diagram")
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: `![](${dataUri})`,
+        probeImageDimensions: async () => ({ width: 200, height: 200 }),
+      }),
+    )
+
+    expect(mockCaptionImage).toHaveBeenCalledTimes(1)
+    // Confirm base64 + mime were passed through to captionImage.
+    const [passedB64, passedMime] = mockCaptionImage.mock.calls[0]
+    expect(passedMime).toBe("image/png")
+    expect(typeof passedB64).toBe("string")
+    expect(passedB64.length).toBeGreaterThan(0)
+    expect(result.stats.captioned).toBe(1)
+    expect(result.rewrittenSourceMarkdown).toContain("![Inline diagram](")
+  })
+
+  it("test 6 — data-uri + NON-empty alt → skippedAuthorAlt", async () => {
+    scaffoldEmptyCaches()
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: `![Hand-written label](${dataUri})`,
+      }),
+    )
+    expect(mockCaptionImage).not.toHaveBeenCalled()
+    expect(result.stats.skippedAuthorAlt).toBe(1)
+    expect(result.stats.captioned).toBe(0)
+    expect(result.rewrittenSourceMarkdown).toContain("![Hand-written label](")
+  })
+
+  it("test 7 — remote + empty alt + BELOW threshold → skippedTooSmall, no VLM", async () => {
+    scaffoldEmptyCaches()
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    stubFetch(async () =>
+      new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    )
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: `![](${remoteUrl})`,
+        probeImageDimensions: async () => ({ width: 8, height: 8 }),
+      }),
+    )
+    expect(mockCaptionImage).not.toHaveBeenCalled()
+    expect(result.stats.captioned).toBe(0)
+    expect(result.stats.skippedTooSmall).toBe(1)
+    // Empty alt preserved.
+    expect(result.rewrittenSourceMarkdown).toMatch(/!\[\]\(/)
+  })
+
+  it("test 8 — probe returns unknown dims (0,0) → treated as over threshold (§2 note)", async () => {
+    scaffoldEmptyCaches()
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    stubFetch(async () =>
+      new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    )
+    mockCaptionImage.mockResolvedValue("Fallback caption")
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: `![](${remoteUrl})`,
+        // Default `makeOpts` probe returns (0,0). Explicit here for clarity.
+        probeImageDimensions: async () => ({ width: 0, height: 0 }),
+      }),
+    )
+    expect(mockCaptionImage).toHaveBeenCalledTimes(1)
+    expect(result.stats.captioned).toBe(1)
+    expect(result.stats.skippedTooSmall).toBe(0)
+  })
+
+  it("test 9 — whitespace-only alt counts as empty (§1)", async () => {
+    scaffoldEmptyCaches()
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    stubFetch(async () =>
+      new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    )
+    mockCaptionImage.mockResolvedValue("Ws chart")
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        // Author wrote `![   ](url)` — treated as empty per §1.
+        markdown: `![   ](${remoteUrl})`,
+        probeImageDimensions: async () => ({ width: 400, height: 300 }),
+      }),
+    )
+    expect(mockCaptionImage).toHaveBeenCalledTimes(1)
+    expect(result.stats.captioned).toBe(1)
+    expect(result.stats.skippedAuthorAlt).toBe(0)
+  })
+
+  it("test 10 — single-word non-empty alt ('image') → skippedAuthorAlt (not overwritten)", async () => {
+    scaffoldEmptyCaches()
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    stubFetch(async () =>
+      new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    )
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: `![image](${remoteUrl})`,
+      }),
+    )
+    expect(mockCaptionImage).not.toHaveBeenCalled()
+    expect(result.stats.skippedAuthorAlt).toBe(1)
+    expect(result.rewrittenSourceMarkdown).toContain("![image](")
+  })
+
+  it("test 30 — codex-cli provider → all empty-alt images route to skippedNoVlmProvider; I/O still runs", async () => {
+    scaffoldEmptyCaches()
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    let fetches = 0
+    stubFetch(async () => {
+      fetches += 1
+      return new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      })
+    })
+
+    // Fixture: 2 empty-alt + 1 non-empty-alt.
+    const md = [
+      `![](https://example.com/a.png)`,
+      `![](https://example.com/b.png)`,
+      `![Author](https://example.com/c.png)`,
+    ].join("\n\n")
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: md,
+        llmConfig: {
+          provider: "codex-cli",
+          model: "gpt-4o-mini",
+        } as unknown as LocalizeOptions["llmConfig"],
+      }),
+    )
+
+    // Provider gate is upfront: VLM never invoked.
+    expect(mockCaptionImage).not.toHaveBeenCalled()
+    expect(result.stats.captioned).toBe(0)
+    expect(result.stats.failed).toBe(0)
+    // The two skip counters partition the "no VLM call" set.
+    expect(result.stats.skippedNoVlmProvider).toBe(2)
+    expect(result.stats.skippedAuthorAlt).toBe(1)
+    expect(result.stats.skippedTooSmall).toBe(0)
+    // I/O still ran for all 3.
+    expect(fetches).toBe(3)
+    expect(result.stats.downloaded).toBe(3)
+    // Empty alts stay byte-identical (empty), non-empty stays verbatim.
+    const src = result.rewrittenSourceMarkdown
+    expect(src).toMatch(/!\[\]\(\.\.\/\.\.\/wiki\/media\/notes\/a-[0-9a-f]{8}\.png\)/)
+    expect(src).toMatch(/!\[\]\(\.\.\/\.\.\/wiki\/media\/notes\/b-[0-9a-f]{8}\.png\)/)
+    expect(src).toContain("![Author](")
+  })
+
+  it("caption cache HIT — same image content across two refs, VLM called once", async () => {
+    // Both refs have the same sha256 → cache hit for the 2nd (in memory).
+    // We simulate a pre-existing on-disk cache too, so VLM is called ZERO
+    // times: both refs consume the cache.
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    // Precompute sha256 of these exact bytes for the pre-seeded cache.
+    // We just seed with a wildcard — the important part is that the
+    // caption cache file exists and, on the 1st image's SHA, contains
+    // a caption. Since we can't easily precompute the sha here without
+    // duplicating the impl, we instead assert on the FRESH path with
+    // an in-memory reuse: two references to the same URL → 1 VLM call.
+    mockFileExists.mockImplementation(async (p: string) => {
+      if (p.endsWith("image-url-cache.json")) return false
+      if (p.endsWith("image-caption-cache.json")) return false
+      return false
+    })
+    mockReadFile.mockResolvedValue("{}")
+
+    stubFetch(async () =>
+      new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    )
+    mockCaptionImage.mockResolvedValue("Shared caption")
+
+    const url = "https://example.com/shared.png"
+    const md = `![](${url})\n\n![](${url})`
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: md,
+        probeImageDimensions: async () => ({ width: 400, height: 300 }),
+      }),
+    )
+
+    // First occurrence: VLM. Second occurrence (same sha256): cache hit.
+    expect(mockCaptionImage).toHaveBeenCalledTimes(1)
+    expect(result.stats.captioned).toBe(1)
+    expect(result.stats.captionCacheHits).toBe(1)
+    // Both refs get the caption in the rewrite.
+    const matches = result.rewrittenSourceMarkdown.match(
+      /!\[Shared caption\]\(/g,
+    )
+    expect(matches).not.toBeNull()
+    expect(matches!.length).toBe(2)
+  })
+
+  it("caption cache WRITE — successful VLM call persists to .llm-wiki/image-caption-cache.json", async () => {
+    scaffoldEmptyCaches()
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    stubFetch(async () =>
+      new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    )
+    mockCaptionImage.mockResolvedValue("Persisted caption")
+
+    await localizeMarkdownImages(
+      makeOpts({
+        markdown: `![](${remoteUrl})`,
+        probeImageDimensions: async () => ({ width: 200, height: 200 }),
+      }),
+    )
+
+    // A writeFile targeting the caption cache path must have happened.
+    const captionWrites = mockWriteFile.mock.calls.filter(([p]) =>
+      String(p).endsWith("image-caption-cache.json"),
+    )
+    expect(captionWrites.length).toBe(1)
+    const [, body] = captionWrites[0]
+    const parsed = JSON.parse(String(body)) as Record<
+      string,
+      { caption: string; mimeType: string; model: string }
+    >
+    const entries = Object.values(parsed)
+    expect(entries.length).toBe(1)
+    expect(entries[0].caption).toBe("Persisted caption")
+    expect(entries[0].mimeType).toBe("image/png")
+    expect(entries[0].model).toBe("test-model")
+  })
+
+  it("caption FAILURE — VLM error isolated; alt stays empty, batch continues", async () => {
+    scaffoldEmptyCaches()
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    stubFetch(async () =>
+      new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    )
+    mockCaptionImage.mockRejectedValue(new Error("model boom"))
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: `![](${remoteUrl})`,
+        probeImageDimensions: async () => ({ width: 200, height: 200 }),
+      }),
+    )
+    // I/O succeeded, VLM failed — NOT counted as `failed` (that field is
+    // reserved for I/O failures). No cache write.
+    expect(result.stats.downloaded).toBe(1)
+    expect(result.stats.failed).toBe(0)
+    expect(result.stats.captioned).toBe(0)
+    // Empty alt survived.
+    expect(result.rewrittenSourceMarkdown).toMatch(/!\[\]\(/)
+    // No caption cache file written.
+    const captionWrites = mockWriteFile.mock.calls.filter(([p]) =>
+      String(p).endsWith("image-caption-cache.json"),
+    )
+    expect(captionWrites.length).toBe(0)
+  })
+
+  it("test 27 — failure isolation: 1 remote 404s, other 2 empty-alt refs still VLM-captioned", async () => {
+    scaffoldEmptyCaches()
+    // Distinct bytes per successful URL so the 2nd doesn't hit the
+    // caption cache from the 1st via sha256 collision.
+    const png1 = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1])
+    const png2 = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 2])
+    stubFetch(async (url) => {
+      if (url.includes("dead.png")) {
+        return new Response("", { status: 404 })
+      }
+      const body = url.includes("ok1") ? png1 : png2
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      })
+    })
+    mockCaptionImage.mockResolvedValue("Still worked")
+
+    const md = [
+      `![](https://example.com/ok1.png)`,
+      `![](https://example.com/dead.png)`,
+      `![](https://example.com/ok2.png)`,
+    ].join("\n\n")
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: md,
+        probeImageDimensions: async () => ({ width: 300, height: 200 }),
+      }),
+    )
+
+    expect(result.stats.downloaded).toBe(2)
+    expect(result.stats.failed).toBe(1)
+    expect(result.stats.captioned).toBe(2)
+    // The dead ref stays untouched (fell out of `localized`).
+    expect(result.rewrittenSourceMarkdown).toContain(
+      "https://example.com/dead.png",
+    )
+    // The other two got captions.
+    const captionMatches = result.rewrittenSourceMarkdown.match(
+      /!\[Still worked\]\(/g,
+    )
+    expect(captionMatches).not.toBeNull()
+    expect(captionMatches!.length).toBe(2)
+  })
+
+  it("test 24 — concurrency limit: with concurrency=2 and 6 refs, at most 2 in-flight fetches", async () => {
+    scaffoldEmptyCaches()
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    let inflight = 0
+    let peak = 0
+    stubFetch(async () => {
+      inflight += 1
+      peak = Math.max(peak, inflight)
+      // Force scheduler yields so concurrent slots overlap.
+      await new Promise((r) => setTimeout(r, 5))
+      inflight -= 1
+      return new Response(png, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      })
+    })
+
+    const md = Array.from(
+      { length: 6 },
+      (_, i) => `![](https://example.com/img${i}.png)`,
+    ).join("\n\n")
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: md,
+        // Author alt non-empty on nothing; but VLM would inflate the
+        // timeline. Force skippedTooSmall so we only measure fetch
+        // concurrency.
+        probeImageDimensions: async () => ({ width: 8, height: 8 }),
+        multimodalConfig: {
+          concurrency: 2,
+          model: "test-model",
+          minImagePixelSize: 64,
+          imageFetchTimeoutMs: 5_000,
+          urlCacheTtlDays: 45,
+          localizeMarkdownImages: true,
+        } as unknown as LocalizeOptions["multimodalConfig"],
+      }),
+    )
+
+    expect(result.stats.downloaded).toBe(6)
+    expect(mockCaptionImage).not.toHaveBeenCalled()
+    expect(peak).toBeLessThanOrEqual(2)
+    expect(peak).toBeGreaterThan(0)
   })
 })
