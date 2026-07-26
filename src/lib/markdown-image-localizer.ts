@@ -38,6 +38,7 @@ import {
 } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
 import { isInsideProject } from "@/lib/markdown-image-resolver"
+import { parseFrontmatter } from "@/lib/frontmatter"
 import { captionImage } from "@/lib/vision-caption"
 import {
   fetchImportUrl,
@@ -934,6 +935,203 @@ export function rewriteBySlot(
     out = out.slice(0, slot.offset) + replacement + out.slice(slot.offset + slot.length)
   }
   return out
+}
+
+// ---------------------------------------------------------------------------
+// Frontmatter `image_sources:` merge (§11) — Commit 4c
+// ---------------------------------------------------------------------------
+//
+// Contract:
+//   - Foreign entries (keys NOT matching `^wiki/media/<slug>/<name>-<sha8>.<ext>$`)
+//     are preserved VERBATIM in their original order, at the top of the
+//     re-emitted `image_sources:` block.
+//   - Localizer-owned entries are fully rewritten each run from
+//     `localizerEntries` — that's the §11 rule-1 lifecycle (this-run's
+//     mapping REPLACES the previous localizer-owned set; entries whose
+//     local path is no longer referenced disappear).
+//   - The rest of the frontmatter is untouched (targeted regex edit,
+//     never a whole-block yaml.dump).
+//   - If the caller's `localizerEntries` is empty AND no foreign entries
+//     exist, the `image_sources:` block is REMOVED entirely (avoids
+//     leaving a phantom `image_sources: {}` behind after the last remote
+//     image is deleted).
+//
+// Key ownership regex — matches the localizer's canonical filename
+// shape: `wiki/media/<slug>/<name>-<sha8>.<ext>` where slug and name
+// can contain any non-`/` byte and ext is [a-z0-9]+. Anchored with
+// `^` and `$` to prevent a `wiki/media/foo/bar/qux-...` (nested subdir)
+// from being reclassified as localizer-owned — that shape is a
+// future cross-subsystem prefix per §11.5 and stays "foreign".
+const LOCALIZER_KEY_RE =
+  /^wiki\/media\/[^/]+\/[^/]+-[0-9a-f]{8}\.[a-z0-9]+$/
+
+/**
+ * Single entry the localizer contributes to `image_sources:`. `source`
+ * is the ORIGINAL URL (remote-http) or a truncated data URI (see
+ * `truncateDataUriForFrontmatter`).
+ */
+export interface FrontmatterImageEntry {
+  /** Project-relative local path — the map KEY. */
+  localPath: string
+  /** Original URL or truncated data-URI marker — the map VALUE. */
+  source: string
+}
+
+/**
+ * Locate the `image_sources:` block within a frontmatter YAML payload,
+ * or return null when absent. Matches the block header line plus all
+ * indented continuation lines that follow it until the first line at
+ * a shallower indent OR the payload end.
+ *
+ * The returned match is bounded to the YAML payload only (caller
+ * substrings the block into `rawBlock` at the right offset).
+ */
+function findImageSourcesBlockInYaml(
+  yamlPayload: string,
+): { blockStart: number; blockEnd: number; existingEntries: Record<string, string> } | null {
+  // Header on its own line, at column 0. Payload always has trailing
+  // newlines from the YAML fence, so `^` is well-defined.
+  const headerRe = /^image_sources:[^\S\r\n]*\r?\n/m
+  const headerMatch = headerRe.exec(yamlPayload)
+  if (!headerMatch) return null
+  const blockStart = headerMatch.index
+  const contentStart = headerMatch.index + headerMatch[0].length
+
+  // Every following line must start with at least one space to belong
+  // to this block. Stop at first zero-indent line or end of payload.
+  const lines = yamlPayload.slice(contentStart).split(/\r?\n/)
+  let consumed = 0
+  const entries: Record<string, string> = {}
+  for (const line of lines) {
+    if (line.length === 0) {
+      // Blank line — end of block (YAML treats bare blank as separator).
+      break
+    }
+    if (!/^\s/.test(line)) {
+      // Zero-indent line → next top-level YAML key. Stop.
+      break
+    }
+    consumed += line.length + 1 // +1 for the \n we split on
+    // Parse `  "key": "value"` or `  key: value` (quoted or bare).
+    const kv = line.match(/^\s+"?([^"]+?)"?:\s*"?([^"]*?)"?\s*$/)
+    if (kv) {
+      entries[kv[1]] = kv[2]
+    }
+  }
+  const blockEnd = contentStart + consumed
+  return { blockStart, blockEnd, existingEntries: entries }
+}
+
+/**
+ * Serialize a `{ key: value }` mapping into the YAML block body
+ * (indented 2-space, double-quoted keys and values, one entry per
+ * line, no trailing newline). Values are escaped for YAML double-
+ * quote syntax: `"` → `\"`, `\` → `\\`.
+ */
+function serializeImageSourcesEntries(
+  entries: Array<{ localPath: string; source: string }>,
+): string {
+  if (entries.length === 0) return ""
+  return entries
+    .map(({ localPath, source }) => {
+      const k = escapeYamlDoubleQuoted(localPath)
+      const v = escapeYamlDoubleQuoted(source)
+      return `  "${k}": "${v}"`
+    })
+    .join("\n")
+}
+
+function escapeYamlDoubleQuoted(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+}
+
+/**
+ * Merge the localizer's current-run entries into the source's
+ * frontmatter `image_sources:` block per §11 lifecycle rules. Returns
+ * the full rewritten content (frontmatter + body).
+ *
+ * @param content - full markdown content (with or without frontmatter)
+ * @param localizerEntries - THIS run's localizer-owned entries. Empty
+ *   array = "this run produced no remote/data-uri images".
+ */
+export function mergeImageSourcesFrontmatter(
+  content: string,
+  localizerEntries: FrontmatterImageEntry[],
+): string {
+  const parsed = parseFrontmatter(content)
+  const { rawBlock, body } = parsed
+  // Deduplicate localizerEntries by key — later wins, mirrors what a
+  // Map produces if the caller happens to pass duplicates.
+  const localizerMap = new Map<string, string>()
+  for (const e of localizerEntries) {
+    localizerMap.set(e.localPath, e.source)
+  }
+  const currentLocalizerEntries: Array<{ localPath: string; source: string }> =
+    [...localizerMap.entries()].map(([localPath, source]) => ({
+      localPath,
+      source,
+    }))
+
+  // Case 1: No frontmatter at all.
+  if (rawBlock.length === 0) {
+    if (currentLocalizerEntries.length === 0) return content
+    const serialized = serializeImageSourcesEntries(currentLocalizerEntries)
+    return `---\nimage_sources:\n${serialized}\n---\n${content.startsWith("\n") ? content.slice(1) : content}`
+  }
+
+  // Case 2: Frontmatter present. Locate/edit `image_sources:` in-place.
+  // `rawBlock` includes opening `---\n`, YAML payload, closing `---\n`.
+  const openingFenceMatch = rawBlock.match(/^---\s*\r?\n/)
+  const closingFenceMatch = rawBlock.match(/\r?\n---\s*(?:\r?\n|$)/)
+  if (!openingFenceMatch || !closingFenceMatch) {
+    // Should not happen — parseFrontmatter emits well-formed rawBlock.
+    // Defensive: bail out unchanged.
+    return content
+  }
+  const openingLen = openingFenceMatch[0].length
+  const closingStart = rawBlock.length - closingFenceMatch[0].length
+  const yamlPayload = rawBlock.slice(openingLen, closingStart)
+
+  const found = findImageSourcesBlockInYaml(yamlPayload)
+  const foreignEntries: Array<{ localPath: string; source: string }> = []
+  if (found) {
+    for (const [k, v] of Object.entries(found.existingEntries)) {
+      // Localizer-owned entries are replaced wholesale by
+      // currentLocalizerEntries. Only foreign entries survive.
+      if (!LOCALIZER_KEY_RE.test(k)) {
+        foreignEntries.push({ localPath: k, source: v })
+      }
+    }
+  }
+
+  // If no entries at all after merge, drop the block entirely.
+  const mergedEntries = [...foreignEntries, ...currentLocalizerEntries]
+  const newBlockText =
+    mergedEntries.length === 0
+      ? ""
+      : `image_sources:\n${serializeImageSourcesEntries(mergedEntries)}\n`
+
+  let newYamlPayload: string
+  if (found) {
+    // Replace the existing block in-place.
+    newYamlPayload =
+      yamlPayload.slice(0, found.blockStart) +
+      newBlockText +
+      yamlPayload.slice(found.blockEnd)
+  } else if (mergedEntries.length > 0) {
+    // No existing block — append before closing fence. Ensure a
+    // trailing newline between the previous YAML content and the new
+    // block; if payload already ends with \n, don't double up.
+    const sep = yamlPayload.length === 0 || yamlPayload.endsWith("\n") ? "" : "\n"
+    newYamlPayload = yamlPayload + sep + newBlockText
+  } else {
+    // No block and nothing to add → payload unchanged.
+    newYamlPayload = yamlPayload
+  }
+
+  const newRawBlock =
+    openingFenceMatch[0] + newYamlPayload + closingFenceMatch[0]
+  return newRawBlock + body
 }
 
 // ---------------------------------------------------------------------------

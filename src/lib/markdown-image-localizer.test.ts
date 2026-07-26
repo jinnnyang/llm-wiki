@@ -39,9 +39,11 @@ import {
   formatImageTitle,
   rewriteBySlot,
   MAX_IMAGE_BYTES,
+  mergeImageSourcesFrontmatter,
   type UrlCacheEntry,
   type LocalizeOptions,
   type RewriteSlot,
+  type FrontmatterImageEntry,
 } from "./markdown-image-localizer"
 import {
   fileExists,
@@ -1927,5 +1929,283 @@ describe("localizeMarkdownImages — Commit 4b VLM decision matrix (§1)", () =>
     expect(mockCaptionImage).not.toHaveBeenCalled()
     expect(peak).toBeLessThanOrEqual(2)
     expect(peak).toBeGreaterThan(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Commit 4c — mergeImageSourcesFrontmatter (§11)
+// ---------------------------------------------------------------------------
+
+describe("mergeImageSourcesFrontmatter — §11 lifecycle", () => {
+  it("test 11 — populates image_sources with remote URL entries in body-only content", () => {
+    const content = "# My notes\n\nHello world.\n"
+    const entries: FrontmatterImageEntry[] = [
+      {
+        localPath: "wiki/media/notes/logo-abc12345.png",
+        source: "https://example.com/logo.png",
+      },
+      {
+        localPath: "wiki/media/notes/hero-def67890.jpg",
+        source: "https://example.com/hero.jpg",
+      },
+    ]
+    const out = mergeImageSourcesFrontmatter(content, entries)
+    expect(out).toMatch(/^---\n/)
+    expect(out).toContain("image_sources:")
+    expect(out).toContain(
+      '"wiki/media/notes/logo-abc12345.png": "https://example.com/logo.png"',
+    )
+    expect(out).toContain(
+      '"wiki/media/notes/hero-def67890.jpg": "https://example.com/hero.jpg"',
+    )
+    expect(out).toContain("# My notes")
+    expect(out).toContain("Hello world.")
+  })
+
+  it("test 11b — includes truncated data-uri entries alongside remote entries", () => {
+    const content = "# Notes\n\n"
+    const longDataUri =
+      "data:image/png;base64," + "iVBORw0KGgoAAAANSUhEUgAA".repeat(50)
+    const truncated = truncateDataUriForFrontmatter(longDataUri)
+    // Sanity: truncateDataUriForFrontmatter enforces §11's 64-char cap.
+    expect(truncated.length).toBeLessThanOrEqual(65)
+    expect(truncated.endsWith("…")).toBe(true)
+
+    const entries: FrontmatterImageEntry[] = [
+      {
+        localPath: "wiki/media/notes/remote-11112222.png",
+        source: "https://example.com/remote.png",
+      },
+      {
+        localPath: "wiki/media/notes/inline-33334444.png",
+        source: truncated,
+      },
+    ]
+    const out = mergeImageSourcesFrontmatter(content, entries)
+    expect(out).toContain(
+      '"wiki/media/notes/remote-11112222.png": "https://example.com/remote.png"',
+    )
+    // The truncated data URI must appear verbatim as the mapping value.
+    expect(out).toContain(`"wiki/media/notes/inline-33334444.png": "${truncated}"`)
+  })
+
+  it("test 12 — re-run drops entries whose local path no longer appears", () => {
+    // Simulate: previous run left 2 localizer entries; this re-run only
+    // produces 1 (user deleted the 2nd ref from the body between runs).
+    const priorContent = [
+      "---",
+      "title: Notes",
+      "image_sources:",
+      '  "wiki/media/notes/keep-aaaaaaaa.png": "https://example.com/keep.png"',
+      '  "wiki/media/notes/drop-bbbbbbbb.png": "https://example.com/drop.png"',
+      "---",
+      "",
+      "# Body",
+      "",
+    ].join("\n")
+
+    const entries: FrontmatterImageEntry[] = [
+      {
+        localPath: "wiki/media/notes/keep-aaaaaaaa.png",
+        source: "https://example.com/keep.png",
+      },
+    ]
+    const out = mergeImageSourcesFrontmatter(priorContent, entries)
+    expect(out).toContain(
+      '"wiki/media/notes/keep-aaaaaaaa.png": "https://example.com/keep.png"',
+    )
+    // The dropped entry must be gone.
+    expect(out).not.toContain("drop-bbbbbbbb.png")
+    expect(out).not.toContain("https://example.com/drop.png")
+    // Other frontmatter keys survive verbatim.
+    expect(out).toContain("title: Notes")
+    // Body untouched.
+    expect(out).toContain("# Body")
+  })
+
+  it("test 13a — foreign entries preserved verbatim across rewrite", () => {
+    // User pre-authored a non-`wiki/media/` entry — foreign per §11.5.
+    const priorContent = [
+      "---",
+      "title: Foreign example",
+      "image_sources:",
+      '  "assets/user-drawing.png": "https://user-source.example/x.png"',
+      "---",
+      "# body",
+      "",
+    ].join("\n")
+
+    const entries: FrontmatterImageEntry[] = [
+      {
+        localPath: "wiki/media/notes/localizer-ccccdddd.png",
+        source: "https://example.com/localizer.png",
+      },
+    ]
+    const out = mergeImageSourcesFrontmatter(priorContent, entries)
+    // Foreign entry byte-preserved.
+    expect(out).toContain(
+      '"assets/user-drawing.png": "https://user-source.example/x.png"',
+    )
+    // Localizer entry appears after foreign entries.
+    expect(out).toContain(
+      '"wiki/media/notes/localizer-ccccdddd.png": "https://example.com/localizer.png"',
+    )
+    // Foreign entry appears BEFORE localizer entry (§11.6 emit order).
+    const foreignIdx = out.indexOf("assets/user-drawing.png")
+    const ownedIdx = out.indexOf("localizer-ccccdddd.png")
+    expect(foreignIdx).toBeGreaterThan(-1)
+    expect(ownedIdx).toBeGreaterThan(foreignIdx)
+    // Non-image_sources frontmatter untouched.
+    expect(out).toContain("title: Foreign example")
+    expect(out).toContain("# body")
+  })
+
+  it("test 13b — user pre-wrote a wiki/media/ key colliding with localizer → OVERWRITTEN", () => {
+    // Per §11.5: keys under `wiki/media/` are RESERVED. If a user
+    // manually writes one, the localizer overwrites it on next run.
+    // Note the key must match the localizer-owned regex — trailing
+    // `-<sha8>.<ext>` — otherwise it counts as foreign (see 13c).
+    const priorContent = [
+      "---",
+      "image_sources:",
+      '  "wiki/media/notes/logo-abc12345.png": "https://user.example/old.png"',
+      "---",
+      "",
+    ].join("\n")
+
+    const entries: FrontmatterImageEntry[] = [
+      {
+        localPath: "wiki/media/notes/logo-abc12345.png",
+        source: "https://example.com/new.png",
+      },
+    ]
+    const out = mergeImageSourcesFrontmatter(priorContent, entries)
+    // Localizer's value replaces the user's.
+    expect(out).toContain(
+      '"wiki/media/notes/logo-abc12345.png": "https://example.com/new.png"',
+    )
+    // The old URL is gone (only the new one remains under that key).
+    expect(out).not.toContain("https://user.example/old.png")
+  })
+
+  it("test 13c — pre-existing wiki/media/ key WITHOUT the -<sha8>.<ext> discriminator stays foreign", () => {
+    // Cross-subsystem prefix per §11.5: `wiki/media/<slug>/mineru/foo.png`
+    // has no `-<sha8>.<ext>` suffix on its last segment. LOCALIZER_KEY_RE
+    // rejects it → treated as foreign → survives.
+    const priorContent = [
+      "---",
+      "image_sources:",
+      '  "wiki/media/notes/mineru/page-01.png": "https://mineru.example/p01.png"',
+      "---",
+      "",
+    ].join("\n")
+
+    const out = mergeImageSourcesFrontmatter(priorContent, [
+      {
+        localPath: "wiki/media/notes/actual-abcd1234.png",
+        source: "https://example.com/actual.png",
+      },
+    ])
+    expect(out).toContain(
+      '"wiki/media/notes/mineru/page-01.png": "https://mineru.example/p01.png"',
+    )
+    expect(out).toContain(
+      '"wiki/media/notes/actual-abcd1234.png": "https://example.com/actual.png"',
+    )
+  })
+
+  it("empty entries + no existing block → content unchanged", () => {
+    const content = "# just prose, no images\n"
+    const out = mergeImageSourcesFrontmatter(content, [])
+    expect(out).toBe(content)
+  })
+
+  it("empty entries + no foreign entries but existing localizer block → block dropped", () => {
+    const priorContent = [
+      "---",
+      "title: Cleanup",
+      "image_sources:",
+      '  "wiki/media/notes/stale-ffffffff.png": "https://example.com/stale.png"',
+      "---",
+      "",
+      "# body",
+      "",
+    ].join("\n")
+
+    const out = mergeImageSourcesFrontmatter(priorContent, [])
+    // Block gone entirely.
+    expect(out).not.toContain("image_sources:")
+    expect(out).not.toContain("stale-ffffffff.png")
+    // Other frontmatter preserved.
+    expect(out).toContain("title: Cleanup")
+    expect(out).toContain("# body")
+  })
+
+  it("duplicate localPath in entries → later wins (dedup by key)", () => {
+    const content = "# Notes\n"
+    const entries: FrontmatterImageEntry[] = [
+      {
+        localPath: "wiki/media/notes/dup-12345678.png",
+        source: "https://example.com/first.png",
+      },
+      {
+        localPath: "wiki/media/notes/dup-12345678.png",
+        source: "https://example.com/second.png",
+      },
+    ]
+    const out = mergeImageSourcesFrontmatter(content, entries)
+    // Only one entry, and it's the second URL.
+    expect(out).toContain('"wiki/media/notes/dup-12345678.png": "https://example.com/second.png"')
+    expect(out).not.toContain("first.png")
+    // Just one line for this key.
+    const matches = out.match(/wiki\/media\/notes\/dup-12345678\.png/g)
+    expect(matches).not.toBeNull()
+    expect(matches!.length).toBe(1)
+  })
+
+  it("preserves non-image_sources keys verbatim (round-trip)", () => {
+    const priorContent = [
+      "---",
+      "title: Round Trip",
+      "tags:",
+      "  - alpha",
+      "  - beta",
+      "custom_field: 42",
+      "---",
+      "",
+      "Body text here.",
+      "",
+    ].join("\n")
+
+    const out = mergeImageSourcesFrontmatter(priorContent, [
+      {
+        localPath: "wiki/media/notes/x-11223344.png",
+        source: "https://example.com/x.png",
+      },
+    ])
+    expect(out).toContain("title: Round Trip")
+    expect(out).toContain("tags:")
+    expect(out).toContain("  - alpha")
+    expect(out).toContain("  - beta")
+    expect(out).toContain("custom_field: 42")
+    expect(out).toContain("image_sources:")
+    expect(out).toContain(
+      '"wiki/media/notes/x-11223344.png": "https://example.com/x.png"',
+    )
+    expect(out).toContain("Body text here.")
+  })
+
+  it("value with embedded double quote is escaped for YAML safety", () => {
+    // Defensive: escape `"` in values so we don't break the block.
+    const out = mergeImageSourcesFrontmatter("# body\n", [
+      {
+        localPath: 'wiki/media/notes/weird-99887766.png',
+        source: 'https://example.com/x?q="hello"',
+      },
+    ])
+    // `\"` (backslash-escaped) inside the double-quoted YAML string.
+    expect(out).toContain(
+      '"wiki/media/notes/weird-99887766.png": "https://example.com/x?q=\\"hello\\""',
+    )
   })
 })
