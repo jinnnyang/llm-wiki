@@ -28,9 +28,14 @@ import {
   resolveDataUri,
   truncateDataUriForFrontmatter,
   localizeMarkdownImages,
+  pathFormFor,
+  formatImageAlt,
+  formatImageTitle,
+  rewriteBySlot,
   MAX_IMAGE_BYTES,
   type UrlCacheEntry,
   type LocalizeOptions,
+  type RewriteSlot,
 } from "./markdown-image-localizer"
 import {
   fileExists,
@@ -1108,5 +1113,326 @@ describe("localizeMarkdownImages — non-remote branches", () => {
     spy.mockRestore()
     expect(result.stats.failed).toBe(1)
     expect(result.stats.downloaded).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Group F/Integration — body rewrite (§4, §7) — Commit 4a
+// ---------------------------------------------------------------------------
+
+describe("pathFormFor — canonical → target-directory-relative (§4)", () => {
+  it("source form uses ../../wiki/media/ prefix", () => {
+    expect(
+      pathFormFor("wiki/media/notes/foo-abc12345.png", "source"),
+    ).toBe("../../wiki/media/notes/foo-abc12345.png")
+  })
+
+  it("wiki form uses ../media/ prefix (drops leading wiki/)", () => {
+    expect(pathFormFor("wiki/media/notes/foo-abc12345.png", "wiki")).toBe(
+      "../media/notes/foo-abc12345.png",
+    )
+  })
+
+  it("passes through paths that don't match the wiki/media/ shape", () => {
+    // Defensive: an absolute path (e.g. an already-localized ref that
+    // slipped through) should not be silently mangled by the rewriter.
+    // The main pipeline filters already-localized out anyway, but this
+    // guards against future callers.
+    expect(pathFormFor("/some/abs/path.png", "source")).toBe(
+      "/some/abs/path.png",
+    )
+    expect(pathFormFor("./relative.png", "wiki")).toBe("./relative.png")
+  })
+
+  it("strips leading slashes from a canonical wiki/media path", () => {
+    // Some producers accidentally hand out `/wiki/media/…` with a
+    // leading slash. Match against the canonical (no-leading-slash) form.
+    expect(
+      pathFormFor("/wiki/media/notes/foo-abc12345.png", "source"),
+    ).toBe("../../wiki/media/notes/foo-abc12345.png")
+  })
+})
+
+describe("formatImageAlt — §7 escape (test 29)", () => {
+  it("passes plain text through unchanged", () => {
+    expect(formatImageAlt("Ferris the crab")).toBe("Ferris the crab")
+  })
+
+  it("escapes unescaped ] characters", () => {
+    expect(formatImageAlt("citation [1] here")).toBe("citation [1\\] here")
+  })
+
+  it("preserves already-escaped \\] in input", () => {
+    // Author (or an upstream tool) already wrote `\]` — we must NOT
+    // double-escape into `\\]`.
+    expect(formatImageAlt("cite [42\\] end")).toBe("cite [42\\] end")
+  })
+
+  it("escapes balanced brackets [foo] into \\[foo\\] round-trip", () => {
+    // Only the `]` gets escaped; `[` is opaque in alt context per
+    // §7 rules. But CommonMark round-trip still recovers it.
+    expect(formatImageAlt("[foo]")).toBe("[foo\\]")
+  })
+
+  it("collapses newlines and tabs to single spaces", () => {
+    expect(formatImageAlt("line one\nline two")).toBe("line one line two")
+    expect(formatImageAlt("tab\there")).toBe("tab here")
+    expect(formatImageAlt("multi\n\n\nspace")).toBe("multi space")
+  })
+
+  it("strips zero-width chars", () => {
+    // U+200B (ZWSP), U+FEFF (BOM), U+200D (ZWJ)
+    expect(formatImageAlt("in\u200Bvis\uFEFFib\u200Dle")).toBe("invisible")
+  })
+
+  it("returns empty string for empty input (author's empty alt preserved)", () => {
+    expect(formatImageAlt("")).toBe("")
+  })
+
+  it("handles the combined case from plan §7 (test 29)", () => {
+    // Input: VLM returns alt with `]`, `\n`, U+200B, and `[foo]`.
+    const raw = "Chart [1]\nrevision\u200B [foo]"
+    expect(formatImageAlt(raw)).toBe("Chart [1\\] revision [foo\\]")
+  })
+})
+
+describe("formatImageTitle — §7 sanitize (test 28)", () => {
+  it("substitutes \" with \\u201D (right double curly quote)", () => {
+    expect(formatImageTitle('a "quoted" phrase')).toBe(
+      "a \u201Dquoted\u201D phrase",
+    )
+  })
+
+  it("leaves backslashes alone (asymmetric with alt escape)", () => {
+    expect(formatImageTitle("path\\to\\file")).toBe("path\\to\\file")
+  })
+
+  it("collapses newlines to spaces", () => {
+    expect(formatImageTitle("multi\nline\ntitle")).toBe("multi line title")
+  })
+
+  it("returns empty string for empty input", () => {
+    expect(formatImageTitle("")).toBe("")
+  })
+
+  it("strips zero-width chars", () => {
+    expect(formatImageTitle("in\u200Bvis\uFEFFible")).toBe("invisible")
+  })
+})
+
+describe("rewriteBySlot — reverse-offset patching", () => {
+  it("returns markdown unchanged when slots array is empty", () => {
+    expect(rewriteBySlot("hello", [], "source")).toBe("hello")
+  })
+
+  it("rewrites a single slot with no title (source form)", () => {
+    const md = "before ![orig alt](https://x.example/foo.png) after"
+    const slots: RewriteSlot[] = [
+      {
+        offset: md.indexOf("!["),
+        length: "![orig alt](https://x.example/foo.png)".length,
+        canonicalRelPath: "wiki/media/notes/foo-abc12345.png",
+        alt: "orig alt",
+        title: undefined,
+      },
+    ]
+    expect(rewriteBySlot(md, slots, "source")).toBe(
+      "before ![orig alt](../../wiki/media/notes/foo-abc12345.png) after",
+    )
+  })
+
+  it("rewrites a single slot with title (wiki form + curly-quote sanitize)", () => {
+    const md = 'x ![alt](https://x.example/f.png "the \\"weird\\" one") y'
+    const orig = '![alt](https://x.example/f.png "the \\"weird\\" one")'
+    const slots: RewriteSlot[] = [
+      {
+        offset: md.indexOf("!["),
+        length: orig.length,
+        canonicalRelPath: "wiki/media/notes/f-abc12345.png",
+        alt: "alt",
+        title: 'the "weird" one',
+      },
+    ]
+    const out = rewriteBySlot(md, slots, "wiki")
+    expect(out).toContain("![alt](../media/notes/f-abc12345.png ")
+    expect(out).toContain('"the \u201Dweird\u201D one"')
+  })
+
+  it("patches multiple slots in reverse order without offset drift", () => {
+    // Two refs; the second one's offset would shift if we patched
+    // left-to-right. Reverse-order patching keeps both offsets valid.
+    const md = "A ![a](https://x.example/a.png) B ![b](https://x.example/b.png) C"
+    const refs = findImageReferencesWithTitle(md)
+    expect(refs).toHaveLength(2)
+    const slots: RewriteSlot[] = refs.map((r, i) => ({
+      offset: r.offset,
+      length: r.length,
+      canonicalRelPath: `wiki/media/notes/img${i}-abcdef${i}${i}.png`,
+      alt: r.alt,
+      title: r.title,
+    }))
+    const out = rewriteBySlot(md, slots, "source")
+    // Both replacements landed and text between is preserved.
+    expect(out).toBe(
+      "A ![a](../../wiki/media/notes/img0-abcdef00.png) B ![b](../../wiki/media/notes/img1-abcdef11.png) C",
+    )
+  })
+
+  it("accepts slots in any input order (defensive sort)", () => {
+    const md = "A ![a](http://x/a.png) B ![b](http://x/b.png) C"
+    const refs = findImageReferencesWithTitle(md)
+    const slots: RewriteSlot[] = [
+      {
+        offset: refs[1].offset,
+        length: refs[1].length,
+        canonicalRelPath: "wiki/media/notes/b-11111111.png",
+        alt: "b",
+        title: undefined,
+      },
+      {
+        offset: refs[0].offset,
+        length: refs[0].length,
+        canonicalRelPath: "wiki/media/notes/a-00000000.png",
+        alt: "a",
+        title: undefined,
+      },
+    ]
+    const out = rewriteBySlot(md, slots, "wiki")
+    expect(out).toBe(
+      "A ![a](../media/notes/a-00000000.png) B ![b](../media/notes/b-11111111.png) C",
+    )
+  })
+
+  it("applies alt escape and title sanitize when rewriting", () => {
+    const md = 'x ![cite [1]](http://x/f.png "old \\"title\\"") y'
+    const orig = '![cite [1]](http://x/f.png "old \\"title\\"")'
+    const slots: RewriteSlot[] = [
+      {
+        offset: md.indexOf("!["),
+        length: orig.length,
+        canonicalRelPath: "wiki/media/notes/f-deadbeef.png",
+        alt: "cite [1]",
+        title: 'old "title"',
+      },
+    ]
+    const out = rewriteBySlot(md, slots, "source")
+    expect(out).toContain("![cite [1\\]](../../wiki/media/notes/f-deadbeef.png")
+    expect(out).toContain('"old \u201Dtitle\u201D"')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Group F integration tests 31–34 — two-form output at the pipeline level
+// ---------------------------------------------------------------------------
+
+describe("localizeMarkdownImages — two-form body output (tests 31-34)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  /** Stub a URL-cache hit for one URL so we don't need a live fetch. */
+  function stubCacheHit(url: string, entry: UrlCacheEntry) {
+    mockFileExists.mockImplementation(async (p: string) => {
+      if (p.endsWith("image-url-cache.json")) return true
+      if (p.endsWith(entry.canonicalRelPath.replace(/^.*\//, ""))) return true
+      return false
+    })
+    mockReadFile.mockResolvedValue(JSON.stringify({ [url]: entry }))
+    stubFetch(async () => new Response("", { status: 500 }))
+  }
+
+  it("test 31/32 — source-form and wiki-form outputs use correct path shapes", async () => {
+    const url = "https://example.com/logo.png"
+    stubCacheHit(url, {
+      sha256: "aa".repeat(32),
+      mimeType: "image/png",
+      width: 0,
+      height: 0,
+      bytesLen: 500,
+      fetchedAt: new Date().toISOString(),
+      canonicalRelPath: "wiki/media/notes/logo-aabbccdd.png",
+    })
+
+    const result = await localizeMarkdownImages(
+      makeOpts({ markdown: `See: ![The logo](${url})` }),
+    )
+
+    // Test 31: raw/sources path form
+    expect(result.rewrittenSourceMarkdown).toBe(
+      "See: ![The logo](../../wiki/media/notes/logo-aabbccdd.png)",
+    )
+    // Test 32: wiki/sources path form
+    expect(result.rewrittenWikiMarkdown).toBe(
+      "See: ![The logo](../media/notes/logo-aabbccdd.png)",
+    )
+  })
+
+  it("test 34 — both forms share alt/title text; only URL differs", async () => {
+    const url = "https://example.com/hero.png"
+    stubCacheHit(url, {
+      sha256: "bb".repeat(32),
+      mimeType: "image/png",
+      width: 0,
+      height: 0,
+      bytesLen: 800,
+      fetchedAt: new Date().toISOString(),
+      canonicalRelPath: "wiki/media/notes/hero-11223344.png",
+    })
+
+    const result = await localizeMarkdownImages(
+      makeOpts({
+        markdown: `![Author's alt text](${url} "hover title")`,
+      }),
+    )
+
+    // Both forms preserve author alt verbatim (Commit 4a takes ref.alt as-is)
+    // and both share the same title.
+    expect(result.rewrittenSourceMarkdown).toContain("![Author's alt text]")
+    expect(result.rewrittenWikiMarkdown).toContain("![Author's alt text]")
+    expect(result.rewrittenSourceMarkdown).toContain('"hover title"')
+    expect(result.rewrittenWikiMarkdown).toContain('"hover title"')
+
+    // Only the URL segment differs between the two.
+    expect(result.rewrittenSourceMarkdown).toContain(
+      "../../wiki/media/notes/hero-11223344.png",
+    )
+    expect(result.rewrittenWikiMarkdown).toContain(
+      "../media/notes/hero-11223344.png",
+    )
+    expect(result.rewrittenSourceMarkdown).not.toContain("../media/")
+    // Note: rewrittenWikiMarkdown *does* contain the substring "../media/"
+    // literally; assert it does NOT contain the source-form prefix.
+    expect(result.rewrittenWikiMarkdown).not.toContain("../../wiki/media/")
+  })
+
+  it("empty markdown (no image refs) returns input verbatim in both fields", async () => {
+    const result = await localizeMarkdownImages(
+      makeOpts({ markdown: "# just prose, no images" }),
+    )
+    expect(result.rewrittenSourceMarkdown).toBe("# just prose, no images")
+    expect(result.rewrittenWikiMarkdown).toBe("# just prose, no images")
+  })
+
+  it("already-localized ref is left untouched in both output forms", async () => {
+    // Author-authored `../../wiki/media/…` reference; localizer's §5
+    // classifier says already-localized → do not touch.
+    mockFileExists.mockImplementation(async (p: string) => {
+      // The classifier resolves against sourceDir (/project/raw/sources)
+      // to `/project/wiki/media/notes/keep-cafebabe.png`. Existence gate.
+      if (p.endsWith("keep-cafebabe.png")) return true
+      return false
+    })
+    mockReadFile.mockResolvedValue("{}")
+
+    const md = "keep this: ![](../../wiki/media/notes/keep-cafebabe.png) done"
+    const result = await localizeMarkdownImages(makeOpts({ markdown: md }))
+
+    // Contract: already-localized refs must round-trip verbatim in the
+    // source form (that's the form the author wrote). Wiki form gets
+    // the same author-authored string — Commit 5's `injectImagesIntoSourceSummary`
+    // may re-emit these differently; here we assert non-mutation.
+    expect(result.rewrittenSourceMarkdown).toBe(md)
+    expect(result.rewrittenWikiMarkdown).toBe(md)
+    expect(result.stats.alreadyLocalized).toBe(1)
   })
 })

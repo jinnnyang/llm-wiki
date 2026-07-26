@@ -14,13 +14,18 @@
  * COMMIT 3c ADDS: HTTP fetch with SSRF / Content-Length / streaming size /
  * Content-Type / timeout defenses, data-URI decoder with truncation and
  * MIME/size guards, and the main `localizeMarkdownImages` entry point
- * (no VLM yet — that's Commit 4). Body rewriting via `rewriteBySlot`
- * and frontmatter `image_sources:` merging via
- * `mergeImageSourcesFrontmatter` are also Commit 4 territory, so the
- * `rewrittenSourceMarkdown` / `rewrittenWikiMarkdown` fields of the
- * result are populated with an empty string in this commit — the
- * `savedImages` and `stats` outputs, plus every I/O side effect, are
- * fully functional.
+ * (no VLM yet — that's Commit 4b).
+ * COMMIT 4a ADDS: Two-form body rewrite — `rewriteBySlot` replaces
+ * `![alt](url ...)` at each ref's recorded offset (in reverse order to
+ * keep earlier offsets valid), using a `pathForm` helper to emit either
+ * the `../../wiki/media/...` source-relative form or the `../media/...`
+ * wiki-relative form. `formatImageAlt` / `formatImageTitle` implement §7
+ * escape (alt: `]`→`\]`, `\n`→space, zero-width strip) vs sanitize (title:
+ * `"`→`\u201D`, `\n`→space). At this commit the alt/title values are
+ * still taken verbatim from `ref.alt` / `ref.title` — VLM captioning
+ * (which decides whether to overwrite empty alts) lands in Commit 4b.
+ * Frontmatter `image_sources:` merging via `mergeImageSourcesFrontmatter`
+ * is Commit 4c.
  */
 import {
   copyFile,
@@ -746,6 +751,190 @@ export function truncateDataUriForFrontmatter(dataUri: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Body rewrite (§4, §7) — Commit 4a
+// ---------------------------------------------------------------------------
+
+/**
+ * Which relative-path form the rewriter should emit. See §4 of the plan.
+ *
+ * - `source`: for `raw/sources/<slug>.md` — uses `../../wiki/media/...`
+ * - `wiki`:   for `wiki/sources/<slug>.md` — uses `../media/...`
+ *
+ * The two forms share zero unique anchor substring, so the rewriter
+ * generates both from the same `SavedImage`-like input rather than
+ * string-replacing one into the other.
+ */
+export type PathForm = "source" | "wiki"
+
+/**
+ * Compute the target-directory-relative path for a localized image,
+ * given its project-root-relative canonical path.
+ *
+ * Input `canonicalRelPath` is always of the shape
+ * `wiki/media/<slug>/<name>-<sha8>.<ext>` (see §4). The two output
+ * forms are literal string prefixes swapped in for the leading
+ * `wiki/`:
+ *
+ *   source → `../../wiki/media/<slug>/<name>-<sha8>.<ext>`
+ *   wiki   → `../media/<slug>/<name>-<sha8>.<ext>`
+ *
+ * Rationale for hardcoded prefixes rather than computing depth from
+ * `sourcePath`: the layout is a project invariant (raw/sources vs
+ * wiki/sources), and hardcoding matches the plan's literal §4 spec.
+ * If a future layout change moves either directory, this helper is
+ * the single point of update.
+ */
+export function pathFormFor(canonicalRelPath: string, form: PathForm): string {
+  // Defensive: some already-localized refs come through with an
+  // absolute path (see main pipeline's already-localized branch).
+  // Rewrite only when we recognize the `wiki/media/` prefix; otherwise
+  // pass through unchanged so the author's original reference isn't
+  // silently mangled.
+  const clean = canonicalRelPath.replace(/^\/+/, "")
+  if (!clean.startsWith("wiki/media/")) {
+    return canonicalRelPath
+  }
+  if (form === "source") {
+    // ../../wiki/media/…
+    return `../../${clean}`
+  }
+  // wiki form: drop the leading `wiki/` and prepend `../`
+  //   wiki/media/notes/foo-abc12345.png → ../media/notes/foo-abc12345.png
+  return `../${clean.slice("wiki/".length)}`
+}
+
+// Zero-width whitespace chars that should be stripped from alt text
+// before emission. Includes ZWSP (U+200B), ZWNJ (U+200C), ZWJ (U+200D),
+// and the byte-order mark (U+FEFF).
+const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF]/g
+
+/**
+ * §7 alt handling — escape, not sanitize. Author or VLM alt text is
+ * emitted such that a CommonMark parser round-trips back to the
+ * original semantic content:
+ *
+ * - `]` → `\]` (CommonMark parsers reverse the backslash-escape on
+ *   read, preserving citation-style `[N]` markers)
+ * - Newlines and tabs → single space (image alt is single-line)
+ * - Zero-width chars stripped
+ * - Backslash before `]` in the input is preserved verbatim (we do
+ *   NOT double-escape an already-escaped bracket).
+ *
+ * The generator never emits `<img>`, angle-bracket URLs, or reference
+ * links — see §7 top-of-file.
+ */
+export function formatImageAlt(alt: string): string {
+  if (alt.length === 0) return ""
+  // Normalize whitespace first so escape logic sees a clean stream.
+  let out = alt
+    .replace(ZERO_WIDTH_RE, "")
+    .replace(/[\r\n\t]+/g, " ")
+  // Escape unescaped `]`. A single character walk keeps this cheap and
+  // avoids regex-driven double-escapes of `\]` sequences the caller
+  // may have already produced.
+  let escaped = ""
+  for (let i = 0; i < out.length; i++) {
+    const ch = out[i]
+    if (ch === "]") {
+      // Look back one char — if it's a backslash, leave the input as-is.
+      if (i > 0 && out[i - 1] === "\\") {
+        escaped += ch
+      } else {
+        escaped += "\\]"
+      }
+    } else {
+      escaped += ch
+    }
+  }
+  // Collapse runs of whitespace introduced by the newline replacement.
+  return escaped.replace(/  +/g, " ")
+}
+
+/**
+ * §7 title handling — sanitize, not escape. Titles are decorative
+ * (hover tooltip) and CJK-friendly emission matters more than
+ * round-trip fidelity:
+ *
+ * - `"` → `\u201D` (right double curly quote, uniform substitution)
+ * - Newlines and tabs → single space
+ * - Zero-width chars stripped
+ *
+ * Backslashes are left as-is; single quotes are left as-is because
+ * the emitted form always wraps in double quotes.
+ */
+export function formatImageTitle(title: string): string {
+  if (title.length === 0) return ""
+  return title
+    .replace(ZERO_WIDTH_RE, "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/"/g, "\u201D")
+    .replace(/  +/g, " ")
+}
+
+/**
+ * A single slot to be rewritten. Produced by the main pipeline from
+ * the `LocalizedImage[]` list plus per-ref alt/title decisions from
+ * the (future) decision matrix. Commit 4a builds these directly from
+ * `ref.alt` / `ref.title` — VLM-driven overrides land in Commit 4b.
+ */
+export interface RewriteSlot {
+  /** Offset and length inside the original body — from `ImageRef`. */
+  offset: number
+  length: number
+  /** Project-root-relative canonical path (`wiki/media/<slug>/…`). */
+  canonicalRelPath: string
+  /** Final alt text to emit (verbatim, before §7 escape). */
+  alt: string
+  /**
+   * Final title to emit (verbatim, before §7 sanitize). Pass
+   * `undefined` to omit the title portion entirely; `""` (empty
+   * string) means "emit empty double quotes" — usually the caller
+   * wants `undefined`.
+   */
+  title: string | undefined
+}
+
+/**
+ * Rewrite `![alt](url ...)` occurrences at each recorded offset,
+ * emitting the target `pathForm` for each slot's canonical path.
+ *
+ * Slots are applied in **reverse offset order** so that patching one
+ * slot doesn't invalidate the offsets of earlier slots. Slots with
+ * overlapping ranges are undefined behavior (the caller — the main
+ * pipeline — never produces overlaps because `findImageReferencesWithTitle`
+ * yields non-overlapping matches).
+ *
+ * Emitted form is always double-quoted title, single line:
+ *
+ *   ![escaped-alt](sanitized-url "sanitized-title")   — with title
+ *   ![escaped-alt](sanitized-url)                     — no title
+ */
+export function rewriteBySlot(
+  markdown: string,
+  slots: readonly RewriteSlot[],
+  form: PathForm,
+): string {
+  if (slots.length === 0) return markdown
+  // Sort a defensive copy in reverse offset order. Callers may pass
+  // any order.
+  const ordered = [...slots].sort((a, b) => b.offset - a.offset)
+  let out = markdown
+  for (const slot of ordered) {
+    const emittedAlt = formatImageAlt(slot.alt)
+    const emittedUrl = pathFormFor(slot.canonicalRelPath, form)
+    let replacement: string
+    if (slot.title === undefined) {
+      replacement = `![${emittedAlt}](${emittedUrl})`
+    } else {
+      const emittedTitle = formatImageTitle(slot.title)
+      replacement = `![${emittedAlt}](${emittedUrl} "${emittedTitle}")`
+    }
+    out = out.slice(0, slot.offset) + replacement + out.slice(slot.offset + slot.length)
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
 // Public entry — main pipeline (Commit 3c; no VLM, no body rewrite)
 // ---------------------------------------------------------------------------
 
@@ -822,8 +1011,8 @@ export async function localizeMarkdownImages(
 
   if (refs.length === 0) {
     return {
-      rewrittenSourceMarkdown: "",
-      rewrittenWikiMarkdown: "",
+      rewrittenSourceMarkdown: markdown,
+      rewrittenWikiMarkdown: markdown,
       savedImages: [],
       stats,
     }
@@ -973,10 +1162,30 @@ export async function localizeMarkdownImages(
       sha256: li.sha8, // sha8 stored here — Commit 4 upgrades to full SHA-256
     }))
 
+  // Build rewrite slots (§4a). At this commit we take alt/title
+  // verbatim from `ref.alt` / `ref.title`. Commit 4b's decision matrix
+  // will overwrite alt/title with VLM output when Axis B allows.
+  //
+  // `already-localized` refs are intentionally skipped: their author-
+  // written reference already points at the correct local file, and the
+  // §5 fall-through contract says we do not touch them. If we DID rewrite
+  // them we'd risk mangling a hand-crafted relative path that already
+  // matches the target `pathForm`.
+  const slots: RewriteSlot[] = localized
+    .filter((li) => li.origin !== "already-localized")
+    .map((li) => ({
+      offset: li.ref.offset,
+      length: li.ref.length,
+      canonicalRelPath: li.relPath,
+      alt: li.ref.alt,
+      title: li.ref.title,
+    }))
+  const rewrittenSourceMarkdown = rewriteBySlot(markdown, slots, "source")
+  const rewrittenWikiMarkdown = rewriteBySlot(markdown, slots, "wiki")
+
   return {
-    // Body rewriting lands in Commit 4 — see module header.
-    rewrittenSourceMarkdown: "",
-    rewrittenWikiMarkdown: "",
+    rewrittenSourceMarkdown,
+    rewrittenWikiMarkdown,
     savedImages,
     stats,
   }
