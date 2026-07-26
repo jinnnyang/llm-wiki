@@ -660,18 +660,30 @@ export async function fetchRemoteImage(
     )
   }
 
-  // Compose timeout with caller's abort. `AbortSignal.any` is standard
-  // as of 2024 but not universally available; fall back to a manual
-  // combiner if needed.
+  // Compose timeout with caller's abort. Prefer `AbortSignal.any`
+  // (standard since 2024); fall back to a manual combiner that
+  // forwards either signal's abort to a fresh controller.
   const timeoutSignal = AbortSignal.timeout(timeoutMs)
-  const signal: AbortSignal = callerSignal
-    ? (typeof (AbortSignal as unknown as { any?: unknown }).any === "function"
-        ? (AbortSignal as unknown as { any: (s: AbortSignal[]) => AbortSignal }).any([
-            timeoutSignal,
-            callerSignal,
-          ])
-        : timeoutSignal)
-    : timeoutSignal
+  let signal: AbortSignal
+  if (!callerSignal) {
+    signal = timeoutSignal
+  } else if (typeof (AbortSignal as unknown as { any?: unknown }).any === "function") {
+    signal = (AbortSignal as unknown as { any: (s: AbortSignal[]) => AbortSignal }).any([
+      timeoutSignal,
+      callerSignal,
+    ])
+  } else {
+    // Manual composition — ensures callerSignal is never silently dropped.
+    const ctrl = new AbortController()
+    const onAbort = () => ctrl.abort()
+    if (timeoutSignal.aborted || callerSignal.aborted) {
+      ctrl.abort()
+    } else {
+      timeoutSignal.addEventListener("abort", onAbort, { once: true })
+      callerSignal.addEventListener("abort", onAbort, { once: true })
+    }
+    signal = ctrl.signal
+  }
 
   // 3: redirect-safe fetch.
   const response = await fetchImportUrl(fetchImpl, url, signal)
@@ -1007,10 +1019,15 @@ function findImageSourcesBlockInYaml(
 
   // Every following line must start with at least one space to belong
   // to this block. Stop at first zero-indent line or end of payload.
-  const lines = yamlPayload.slice(contentStart).split(/\r?\n/)
+  // Use a regex that preserves the actual line-separator length so
+  // `consumed` stays correct on both LF and CRLF payloads.
+  const lineRe = /([^\r\n]*)(\r?\n|$)/g
   let consumed = 0
   const entries: Record<string, string> = {}
-  for (const line of lines) {
+  let lm: RegExpExecArray | null
+  while ((lm = lineRe.exec(yamlPayload.slice(contentStart))) !== null) {
+    const line = lm[1]
+    const sepLen = lm[2].length
     if (line.length === 0) {
       // Blank line — end of block (YAML treats bare blank as separator).
       break
@@ -1019,12 +1036,14 @@ function findImageSourcesBlockInYaml(
       // Zero-indent line → next top-level YAML key. Stop.
       break
     }
-    consumed += line.length + 1 // +1 for the \n we split on
+    consumed += line.length + sepLen
     // Parse `  "key": "value"` or `  key: value` (quoted or bare).
     const kv = line.match(/^\s+"?([^"]+?)"?:\s*"?([^"]*?)"?\s*$/)
     if (kv) {
       entries[kv[1]] = kv[2]
     }
+    // If the separator was empty we hit the end of the string.
+    if (sepLen === 0) break
   }
   const blockEnd = contentStart + consumed
   return { blockStart, blockEnd, existingEntries: entries }
@@ -1272,9 +1291,9 @@ async function defaultProbeImageDimensions(
 }
 
 /**
- * Extract full SHA-256 for a bytes buffer. Same helper as the private
- * `sha256OfBytesFull` at the bottom of this file — kept together with
- * the caption logic for readability at the caller site.
+ * Extract full SHA-256 hex for a bytes buffer. Used as the caption
+ * cache key and the URL cache digest. Same TS-strict-mode ArrayBuffer
+ * dance as `sha8OfBytes`.
  */
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const buf = bytes.buffer.slice(
@@ -1851,7 +1870,11 @@ async function handleRemoteHttp(
     globalThis.fetch,
     ctx.signal,
   )
-  const sha8 = await sha8OfBytes(bytes)
+  // Single SHA-256 pass — sha8 is the first 8 hex chars of the full
+  // digest (avoids a second crypto.subtle.digest on potentially large
+  // buffers).
+  const fullSha256 = await sha256Hex(bytes)
+  const sha8 = fullSha256.slice(0, 8)
   const ext = extFromMime(mimeType)
   const baseName = deriveNameFromUrl(url)
   const fileName = `${baseName}-${sha8}.${ext}`
@@ -1864,12 +1887,6 @@ async function handleRemoteHttp(
   if (!(await fileExists(absPath))) {
     await writeFileBase64(absPath, bytesToBase64(bytes))
   }
-
-  // Compute full SHA-256 for the URL cache entry. sha8 is enough for the
-  // filename disambiguator, but the cache carries the full digest so
-  // future consumers (dedup verification, caption cache alignment) can
-  // key on it.
-  const fullSha256 = await sha256OfBytesFull(bytes)
 
   await upsertUrlCacheEntry(ctx.projectPath, url, {
     sha256: fullSha256,
@@ -1913,8 +1930,8 @@ async function handleDataUri(
   bytesB64: string
 }> {
   const { bytes, mimeType } = resolveDataUri(dataUri)
-  const sha8 = await sha8OfBytes(bytes)
   const sha256 = await sha256Hex(bytes)
+  const sha8 = sha256.slice(0, 8)
   const ext = extFromMime(mimeType)
   const fileName = `inline-${sha8}.${ext}`
   const absPath = `${ctx.mediaDir}/${fileName}`
@@ -1972,8 +1989,8 @@ async function handleLocalRelative(
       `Local image exceeds ${MAX_IMAGE_BYTES} bytes: ${srcAbs}`,
     )
   }
-  const sha8 = await sha8OfBytes(bytes)
   const sha256 = await sha256Hex(bytes)
+  const sha8 = sha256.slice(0, 8)
   const mimeType = probedMime && probedMime.startsWith(IMAGE_MIME_PREFIX)
     ? probedMime
     : extToMime(
@@ -2057,18 +2074,4 @@ function extToMime(ext: string): string {
   }
 }
 
-/**
- * Full SHA-256 (not the 8-char prefix). Used by the URL cache to key
- * against the caption cache. Same TS-strict-mode ArrayBuffer dance as
- * `sha8OfBytes`.
- */
-async function sha256OfBytesFull(bytes: Uint8Array): Promise<string> {
-  const buf = bytes.buffer.slice(
-    bytes.byteOffset,
-    bytes.byteOffset + bytes.byteLength,
-  ) as ArrayBuffer
-  const digest = await crypto.subtle.digest("SHA-256", buf)
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("")
-}
+
