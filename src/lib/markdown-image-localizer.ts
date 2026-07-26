@@ -40,6 +40,7 @@ import { normalizePath } from "@/lib/path-utils"
 import { isInsideProject } from "@/lib/markdown-image-resolver"
 import { parseFrontmatter } from "@/lib/frontmatter"
 import { captionImage } from "@/lib/vision-caption"
+import { embedImageMetadata } from "@/lib/image-metadata-embed"
 import {
   fetchImportUrl,
   isPrivateNetworkHost,
@@ -118,6 +119,9 @@ export interface LocalizeResult {
      */
     skippedNoVlmProvider: number
     failed: number
+    // Metadata embedding (Phase 3)
+    metadataEmbedded: number
+    metadataSkipped: number
   }
 }
 
@@ -1463,6 +1467,8 @@ export async function localizeMarkdownImages(
     skippedTooSmall: 0,
     skippedNoVlmProvider: 0,
     failed: 0,
+    metadataEmbedded: 0,
+    metadataSkipped: 0,
   }
 
   if (refs.length === 0) {
@@ -1752,6 +1758,35 @@ export async function localizeMarkdownImages(
 
   if (captionCacheDirty) {
     await writeCaptionCache(projectPath, captionCache)
+  }
+
+  // -------------------------------------------------------------------
+  // Phase 3: Metadata embedding — write VLM-generated alt/title into
+  // the image file's own metadata (XMP/EXIF/IPTC/PNG text chunks).
+  // Runs after files are on disk and VLM captions are finalized.
+  // Non-fatal: failures are counted in stats but never abort the batch.
+  // -------------------------------------------------------------------
+  const embedCandidates = localized.filter(
+    (li) =>
+      li.origin !== "already-localized" &&
+      (li.vlmOutcome === "captioned" || li.vlmOutcome === "cache-hit"),
+  )
+  for (const li of embedCandidates) {
+    if (signal?.aborted) break
+    const alt = li.finalAlt
+    const title = li.finalTitle ?? ""
+    if (!alt && !title) {
+      stats.metadataSkipped += 1
+      continue
+    }
+    const result = await embedImageMetadata({
+      absPath: li.absPath,
+      alt,
+      title,
+      mimeType: li.mimeType,
+    })
+    if (result.written) stats.metadataEmbedded += 1
+    else stats.metadataSkipped += 1
   }
 
   const savedImages: SavedImage[] = localized

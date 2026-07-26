@@ -826,7 +826,8 @@ async function autoIngestImpl(
         `[ingest:localizer] "${fileName}": ` +
           `${result.stats.downloaded}dl ${result.stats.captioned}cap ` +
           `${result.stats.skippedAuthorAlt}skip-alt ${result.stats.skippedTooSmall}skip-small ` +
-          `${result.stats.skippedNoVlmProvider}skip-nvlm ${result.stats.failed}fail`,
+          `${result.stats.skippedNoVlmProvider}skip-nvlm ${result.stats.failed}fail ` +
+          `${result.stats.metadataEmbedded}meta-embed`,
       )
     } catch (err) {
       console.warn(
