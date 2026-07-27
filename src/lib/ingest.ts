@@ -756,6 +756,7 @@ async function autoIngestImpl(
   //    full-pipeline branches). Hoisting collapses the pair. ──
   const mmCfg = useWikiStore.getState().multimodalConfig
   const captionLlm = resolveCaptionConfig(mmCfg, llmConfig)
+  const shouldLocalize = mmCfg.enabled && mmCfg.localizeMarkdownImages
 
   // ── Step 0.4: Localize markdown image references (md sources only) ──
   //
@@ -782,7 +783,7 @@ async function autoIngestImpl(
   let workingWikiSourceContent = sourceContent
   let markdownLocalizedImages: SavedImage[] = []
 
-  if (isMarkdown && mmCfg.enabled && mmCfg.localizeMarkdownImages) {
+  if (isMarkdown && shouldLocalize) {
     try {
       const result = await localizeMarkdownImages({
         projectPath: pp,
@@ -860,7 +861,7 @@ async function autoIngestImpl(
         : await extractAndSaveSourceImages(pp, sp, sourceSummarySlug)
       // When the localizer ran (Step 0.4), markdown images are already
       // localized — skip the legacy extractor to avoid double-copy.
-      if (!(mmCfg.enabled && mmCfg.localizeMarkdownImages)) {
+      if (!shouldLocalize) {
         const markdownImages = await extractAndSaveMarkdownImages(pp, sp, workingSourceContent, sourceSummarySlug)
         savedImages = [...savedImages, ...markdownImages]
       } else {
@@ -962,7 +963,7 @@ async function autoIngestImpl(
     : await extractAndSaveSourceImages(pp, sp, sourceSummarySlug)
   // When the localizer ran (Step 0.4), markdown images are already
   // localized — skip the legacy extractor to avoid double-copy.
-  if (!(mmCfg.enabled && mmCfg.localizeMarkdownImages)) {
+  if (!shouldLocalize) {
     const markdownImages = await extractAndSaveMarkdownImages(pp, sp, workingSourceContent, sourceSummarySlug)
     savedImages = [...savedImages, ...markdownImages]
   } else {

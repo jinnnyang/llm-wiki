@@ -211,7 +211,7 @@ export function findImageReferencesWithTitle(markdown: string): ImageRef[] {
       alt,
       url,
       title: titleInner,
-      titleDelim: (delim as '"' | "'" | undefined) ?? undefined,
+      titleDelim: delim as '"' | "'" | undefined,
     })
   }
   return refs
@@ -464,11 +464,9 @@ export async function sha8OfBytes(bytes: Uint8Array): Promise<string> {
  * being marked `failed`).
  *
  * `sourceDir` should be the directory of the raw-sources markdown file
- * (`raw/sources/<slug>.md`'s parent). Callers use `sourcePath` from
- * `LocalizeOptions` — the ingest orchestrator passes an absolute path,
- * and this function computes the directory internally... no, it doesn't:
- * we take `sourceDir` directly so callers can be explicit about which
- * markdown file relative URLs resolve against.
+ * (`raw/sources/<slug>.md`'s parent). Callers pass `sourceDir` directly
+ * so they can be explicit about which markdown file relative URLs
+ * resolve against.
  */
 export async function classifyImageUrl(
   url: string,
@@ -497,7 +495,7 @@ export async function classifyImageUrl(
   )
   if (!insideProject) return "failed"
 
-  const exists = await Promise.resolve(fileExists(absPath)).catch(() => false)
+  const exists = await fileExists(absPath).catch(() => false)
 
   if (ALREADY_LOCALIZED_SUFFIX_RE.test(absPath) && exists) {
     return "already-localized"
@@ -582,6 +580,14 @@ function bytesToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...chunk)
   }
   return btoa(binary)
+}
+
+/** Inverse of `bytesToBase64` — decode a base64 string to raw bytes. */
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
 }
 
 /**
@@ -752,10 +758,7 @@ export function resolveDataUri(
   }
   let bytes: Uint8Array
   try {
-    // atob returns latin-1 chars — each maps to one output byte.
-    const binary = atob(payload)
-    bytes = new Uint8Array(binary.length)
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+    bytes = base64ToBytes(payload)
   } catch {
     throw new Error("Malformed base64 in data URI")
   }
@@ -1698,9 +1701,7 @@ export async function localizeMarkdownImages(
     let dims = { width: li.width, height: li.height }
     if (li.base64ForCaption && (dims.width === 0 || dims.height === 0)) {
       // Decode base64 → bytes for the probe. Skip probe on empty base64.
-      const b = atob(li.base64ForCaption)
-      const bytes = new Uint8Array(b.length)
-      for (let i = 0; i < b.length; i++) bytes[i] = b.charCodeAt(i)
+      const bytes = base64ToBytes(li.base64ForCaption)
       dims = await probe(li.mimeType, bytes)
       li.width = dims.width
       li.height = dims.height
@@ -1713,10 +1714,10 @@ export async function localizeMarkdownImages(
     }
     // §1 Axis B empty alt + captionable → call VLM.
     if (!li.base64ForCaption) {
-      // Defensive: this branch should only be reached for empty-alt
-      // captionable refs, which retained bytes in phase 1. If bytes
-      // were dropped (e.g. URL cache hit path with no re-read), fall
-      // through to "leave alt empty" without failing the whole batch.
+      // Defensive: bytes were not retained (e.g. URL cache hit skips
+      // re-read). VLM can't run without bytes — count as skipped.
+      // Reuses the too-small bucket to avoid adding a new stat field;
+      // the per-image vlmOutcome still records the real reason.
       li.vlmOutcome = "skipped-too-small"
       stats.skippedTooSmall += 1
       continue
@@ -2016,9 +2017,7 @@ async function handleLocalRelative(
   // The command also returns the Rust-side MIME guess, which is more
   // accurate than sniffing the extension.
   const { base64: b64, mimeType: probedMime } = await readFileAsBase64(srcAbs)
-  const binary = atob(b64)
-  const bytes = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  const bytes = base64ToBytes(b64)
   if (bytes.byteLength > MAX_IMAGE_BYTES) {
     throw new Error(
       `Local image exceeds ${MAX_IMAGE_BYTES} bytes: ${srcAbs}`,

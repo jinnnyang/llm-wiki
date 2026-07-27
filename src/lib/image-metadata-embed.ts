@@ -93,15 +93,8 @@ export async function embedImageMetadata(
  * non-empty.
  */
 function buildXmpPacket(alt: string, title: string): string {
-  const escXml = (s: string) =>
-    s
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-
-  const altEsc = escXml(alt)
-  const titleEsc = escXml(title)
+  const altEsc = escapeXml(alt)
+  const titleEsc = escapeXml(title)
 
   const titleBlock = title
     ? `\n      <dc:title>\n        <rdf:Alt>\n          <rdf:li xml:lang="x-default">${titleEsc}</rdf:li>\n        </rdf:Alt>\n      </dc:title>`
@@ -297,7 +290,7 @@ function findPngChunk(bytes: Uint8Array, type: string): number {
   let pos = 8 // skip signature
   while (pos + 8 <= bytes.length) {
     const len =
-      (bytes[pos] << 24) | (bytes[pos + 1] << 16) | (bytes[pos + 2] << 8) | bytes[pos + 3]
+      ((bytes[pos] << 24) | (bytes[pos + 1] << 16) | (bytes[pos + 2] << 8) | bytes[pos + 3]) >>> 0
     // Check type match
     let match = true
     for (let i = 0; i < 4; i++) {
@@ -412,19 +405,22 @@ function embedWebp(
     // Need to synthesize a VP8X header. Extract dimensions from VP8/VP8L.
     const vp8Chunk = kept.find((c) => c.fourcc === "VP8 " || c.fourcc === "VP8L")!
     const dims = getWebpDimensions(vp8Chunk)
-    const vp8x = new Uint8Array(10)
-    vp8x[0] = 0x0c // flags: EXIF + XMP
-    // bytes 1-3: reserved (0)
-    // bytes 4-6: canvas width - 1 (24-bit LE)
-    vp8x[4] = (dims.width - 1) & 0xff
-    vp8x[5] = ((dims.width - 1) >> 8) & 0xff
-    vp8x[6] = ((dims.width - 1) >> 16) & 0xff
-    // bytes 7-9: canvas height - 1 (24-bit LE)
-    vp8x[7] = (dims.height - 1) & 0xff
-    vp8x[8] = ((dims.height - 1) >> 8) & 0xff
-    vp8x[9] = ((dims.height - 1) >> 16) & 0xff
-    outChunks.push({ fourcc: "VP8X", data: vp8x })
-    // Then all kept chunks.
+    if (dims) {
+      const vp8x = new Uint8Array(10)
+      vp8x[0] = 0x0c // flags: EXIF + XMP
+      // bytes 1-3: reserved (0)
+      // bytes 4-6: canvas width - 1 (24-bit LE)
+      vp8x[4] = (dims.width - 1) & 0xff
+      vp8x[5] = ((dims.width - 1) >> 8) & 0xff
+      vp8x[6] = ((dims.width - 1) >> 16) & 0xff
+      // bytes 7-9: canvas height - 1 (24-bit LE)
+      vp8x[7] = (dims.height - 1) & 0xff
+      vp8x[8] = ((dims.height - 1) >> 8) & 0xff
+      vp8x[9] = ((dims.height - 1) >> 16) & 0xff
+      outChunks.push({ fourcc: "VP8X", data: vp8x })
+    }
+    // Then all kept chunks (VP8X omitted when dims unknown — better
+    // a missing VP8X than one with bogus 1×1 canvas dimensions).
     for (const c of kept) outChunks.push(c)
   } else {
     // Animated or unknown layout — just append.
@@ -472,7 +468,7 @@ function embedWebp(
   return out
 }
 
-function getWebpDimensions(chunk: { fourcc: string; data: Uint8Array }): { width: number; height: number } {
+function getWebpDimensions(chunk: { fourcc: string; data: Uint8Array }): { width: number; height: number } | null {
   if (chunk.fourcc === "VP8 ") {
     // Lossy: frame tag at bytes 6-9 (after 3-byte frame tag + 3-byte start code)
     // Actually: data[0..2] = frame tag, data[3..5] = start code 0x9D 0x01 0x2A
@@ -492,8 +488,7 @@ function getWebpDimensions(chunk: { fourcc: string; data: Uint8Array }): { width
       return { width: w, height: h }
     }
   }
-  // Fallback
-  return { width: 1, height: 1 }
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -541,9 +536,11 @@ function embedSvg(
   const descEl = alt ? `\n  <desc>${escapeXml(alt)}</desc>` : ""
   if (titleEl || descEl) {
     // Insert after <svg...> (and after metadata if we just added it).
+    // Fallback anchors on the <svg> tag, not the document start —
+    // a leading <?xml ...?> declaration's ">" would be wrong.
     const insertPos = out.indexOf("<metadata") >= 0
       ? out.indexOf("</metadata>") + "</metadata>".length
-      : out.indexOf(">") + 1
+      : out.indexOf(">", out.search(/<svg[\s>]/i)) + 1
     out = out.slice(0, insertPos) + titleEl + descEl + out.slice(insertPos)
   }
 
