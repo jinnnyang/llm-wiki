@@ -212,10 +212,11 @@ function buildIptcIim(alt: string, title: string): Uint8Array {
 
   const iimTotal = records.reduce((s, r) => s + r.length, 0)
 
-  // Photoshop IRB wrapper: "8BIM" [id:2=0x0404] [name:1=0] [len:4] [IIM data] [pad]
-  const nameLen = 1 // single null byte (empty Pascal string padded to even)
+  // Photoshop IRB wrapper: "8BIM" [id:2=0x0404] [name:2] [len:4] [IIM data] [pad]
+  // Pascal string name: 1-byte count (0) + pad byte → 2 bytes total.
+  const nameLen = 2
   const wrapperLen = 4 + 2 + nameLen + 4 + iimTotal
-  const padded = wrapperLen + (wrapperLen % 2) // pad to even
+  const padded = wrapperLen + (wrapperLen % 2) // pad to even (covers odd IIM data)
 
   const out = new Uint8Array(padded)
   let off = 0
@@ -505,11 +506,13 @@ function embedSvg(
   title: string,
 ): Uint8Array | null {
   const text = new TextDecoder("utf-8").decode(bytes)
-  // Find the end of the opening <svg ...> tag.
-  const svgOpenEnd = text.indexOf(">")
+  // Find the <svg ...> opening tag. A bare indexOf(">") would hit the
+  // closing `?>` of a leading `<?xml ...?>` declaration, so anchor on
+  // the `<svg` tag start first.
+  const svgTagStart = text.search(/<svg[\s>]/i)
+  if (svgTagStart < 0) return null
+  const svgOpenEnd = text.indexOf(">", svgTagStart)
   if (svgOpenEnd < 0) return null
-  // Verify it looks like SVG.
-  if (!/<svg[\s>]/i.test(text.slice(0, svgOpenEnd + 1))) return null
 
   // If there's already a <metadata> block, replace it.
   const metaStart = text.indexOf("<metadata")
@@ -615,7 +618,7 @@ function buildExifTiff(alt: string, title: string): Uint8Array {
 
   // Entry 2: ExifIFD pointer (0x8769), type LONG (4), count 1
   view.setUint16(off, 0x8769, true); off += 2
-  view.setUint16(off, 4, true); off += 4 // LONG
+  view.setUint16(off, 4, true); off += 2 // LONG
   view.setUint32(off, 1, true); off += 4
   view.setUint32(off, exifIfdOffset, true); off += 4
 

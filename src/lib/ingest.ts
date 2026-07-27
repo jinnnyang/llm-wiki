@@ -863,6 +863,8 @@ async function autoIngestImpl(
       if (!(mmCfg.enabled && mmCfg.localizeMarkdownImages)) {
         const markdownImages = await extractAndSaveMarkdownImages(pp, sp, workingSourceContent, sourceSummarySlug)
         savedImages = [...savedImages, ...markdownImages]
+      } else {
+        savedImages = [...savedImages, ...markdownLocalizedImages]
       }
       console.log(`[ingest:diag] cache-hit branch: got ${savedImages.length} image(s)`)
       if (savedImages.length > 0) {

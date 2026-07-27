@@ -1,13 +1,62 @@
 ---
 kind: walkthrough
-last_updated: '2026-07-26T10:33:24+00:00'
+last_updated: '2026-07-27T01:09:35+00:00'
 last_writer: hand-off
-last_agent: hermes-devops
-session_id: handoff-20260726
-last_verified: '2026-07-26T10:33:10+00:00'
+last_agent: hermes-agent
+session_id: hermes-default
+last_verified: '2026-07-27T01:09:25+00:00'
 ---
 
 # Walkthrough — llm-wiki
+
+## 2026-07-26 (evening) — Second code review: 4 bugs fixed in metadata embedder + ingest
+
+<!-- keep -->
+
+### Session arc
+
+1. **User requested full code review** of the `feat/markdown-image-localizer` branch — "请你评审当前代码修改，仔细排查所有BUG与隐患".
+2. **Reviewed ~7,300 lines across 21 files** (git diff main). Read every changed source file line-by-line: `markdown-image-localizer.ts` (2,112 lines), `image-metadata-embed.ts` (709 lines), `ingest.ts` diff (+156 lines), plus 6 smaller changed files.
+3. **Ran verification baseline**: `npx tsc --noEmit` clean, `npx vitest run` → 1,877 pass / 6 fail (all pre-existing: MCP server tests + real-TCP CORS env issues).
+4. **Found 4 bugs + 1 pre-existing type error**, ordered by severity:
+   - **BUG 1 (CRITICAL)** — `image-metadata-embed.ts:618`: EXIF TIFF builder `buildExifTiff` wrote `view.setUint16(off, 4, true); off += 4` — a 2-byte write advancing the offset by 4. IFD entry became 14 bytes instead of 12, shifting all subsequent fields. `exifIfdOffset` pointed 2 bytes before the actual ExifIFD → WebP EXIF metadata silently corrupt. Fix: `off += 2`.
+   - **BUG 2 (MEDIUM)** — `image-metadata-embed.ts:216`: IPTC IIM builder `buildIptcIim` set `nameLen = 1` but the code writes 2 bytes (Pascal string count byte + pad byte at lines 233-234). Buffer underallocated by 1; when `iimTotal` is odd, the padding math produces a buffer 2 bytes too short → `Uint8Array.set()` silently truncates the last IIM record. Fix: `nameLen = 2`.
+   - **BUG 3 (MEDIUM)** — `image-metadata-embed.ts:509`: `embedSvg` used `text.indexOf(">")` to find the `<svg>` tag end. SVGs with `<?xml version="1.0"?>` declarations hit the `?>` closing bracket instead; the subsequent `/<svg[\s>]/i` regex failed on the XML prolog → function returned `null`, metadata embedding silently skipped. Fix: `text.search(/<svg[\s>]/i)` to locate the tag start, then `text.indexOf(">", svgTagStart)` for the closing bracket.
+   - **BUG 4 (MEDIUM)** — `ingest.ts:860`: cache-hit branch skipped `extractAndSaveMarkdownImages` when localizer enabled (correct) but never added `markdownLocalizedImages` to `savedImages`. The full-pipeline branch (line 964) had the correct `else` clause. Result: first ingest worked; second ingest (cache hit, e.g. source-watch re-trigger) lost all localized images from downstream caption + source-summary injection. Fix: added matching `else { savedImages = [...savedImages, ...markdownLocalizedImages] }`.
+   - **Pre-existing type error** — `image-metadata-embed.test.ts:134`: mock resolved `{ base64, path }` but `FileBase64` interface requires `{ base64, mimeType }`. Fix: replaced `path` with `mimeType: "image/png"`.
+5. **Also identified 4 non-bug observations** (code hygiene / product, not fixed):
+   - `sha8OfBytes` exported but unused in production (tests import it directly).
+   - `bytesToBase64` duplicated across two modules.
+   - `localizeMarkdownImages` defaults to `true` — open product decision (H2).
+   - `findImageSourcesBlockInYaml` KV regex can't handle escaped quotes in foreign entries.
+6. **User said "开始修复"** — applied all 5 fixes across 3 files.
+7. **Verification**: `npm run typecheck` clean (0 errors), `npm run build` clean (23.26s), `npx vitest run` → 1,877 pass / 6 fail (same pre-existing set), 158/158 localizer+metadata tests pass.
+
+### Files touched this session
+
+Uncommitted (ready to commit):
+
+```
+src/lib/image-metadata-embed.ts       ← BUG 1 + BUG 2 + BUG 3
+src/lib/ingest.ts                     ← BUG 4
+src/lib/image-metadata-embed.test.ts  ← pre-existing type error
+```
+
+Working tree also carries pre-existing `M package-lock.json` and untracked `CLAUDE.md`.
+
+### Key decisions
+
+- All 4 bugs were implementation errors, not design flaws. The module architecture (pure byte manipulation, format dispatch, non-fatal error handling) is sound.
+- BUG 1 was the most severe: every WebP image that went through Phase 3 metadata embedding had corrupt EXIF. XMP and IPTC were unaffected (different code paths).
+- BUG 4 was a copy-paste omission between the two ingest branches (cache-hit vs full-pipeline). The full-pipeline branch was correct; the cache-hit branch was missing the `else` clause.
+
+### Open items for next session
+
+- **Commit the 3 modified files** (user hasn't decided on commit message yet).
+- H2: product decision on `localizeMarkdownImages` default value.
+- M3-M6: medium-priority review items (see task.md "Open review items").
+- Settings UI for new config fields (Phase 3).
+
 
 ## 2026-07-26 — Code review fixes + Phase 3 metadata embedding
 

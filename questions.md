@@ -1,12 +1,10 @@
 ---
 kind: questions
-version: 1
-last_updated: '2026-07-26T10:33:24+00:00'
-last_verified: '2026-07-26T10:33:11+00:00'
-last_agent: hermes-devops
+last_updated: '2026-07-27T01:09:35+00:00'
 last_writer: hand-off
-session_id: handoff-20260726
-status: in-progress
+last_agent: hermes-agent
+session_id: hermes-default
+last_verified: '2026-07-27T01:09:26+00:00'
 ---
 
 # Questions
@@ -37,6 +35,12 @@ status: in-progress
 
 No decision made yet. Current code ships with `true`.
 
+### Commit the second-review bug fixes · 2026-07-26
+
+<!-- keep -->
+
+Three files modified (uncommitted): `image-metadata-embed.ts`, `ingest.ts`, `image-metadata-embed.test.ts`. Suggested commit message: `fix(localizer): second code review — EXIF offset, IPTC buffer, SVG xml-decl, cache-hit images`. User hasn't confirmed yet.
+
 ## Closed
 
 - None.
@@ -65,4 +69,3 @@ take-over Step 2 check-reality flagged 2 HARD conflicts of type `missing_file_in
 Not real path references. Force-continue accepted. Fixed in task.md by replacing with `<source-root>/wiki/media/…` placeholder notation. <!-- resolved -->
 
 - None.
-

@@ -131,7 +131,7 @@ beforeEach(() => {
 })
 
 function setupRead(bytes: Uint8Array) {
-  mockRead.mockResolvedValue({ base64: bytesToB64(bytes), path: "/fake/img" })
+  mockRead.mockResolvedValue({ base64: bytesToB64(bytes), mimeType: "image/png" })
 }
 
 function getWrittenBytes(): Uint8Array {

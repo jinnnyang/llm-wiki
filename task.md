@@ -1,16 +1,16 @@
 ---
 kind: task
-last_updated: '2026-07-26T10:33:08+00:00'
+last_updated: '2026-07-27T01:09:15+00:00'
 last_writer: hand-off
-last_agent: hermes-devops
-session_id: handoff-20260726
-last_verified: '2026-07-26T10:33:08+00:00'
+last_agent: hermes-agent
+session_id: hermes-default
+last_verified: '2026-07-27T01:09:15+00:00'
 ---
 
 # Task — markdown image localizer (Phase 1)
 
 **Branch:** `feat/markdown-image-localizer` (based on `e8bdec6`, upstream v0.6.5 tip)
-**Overall status:** All 5 planned commits done. Code review fixes + Phase 3 metadata embedding landed.
+**Overall status:** All 5 planned commits done. Code review fixes + Phase 3 metadata embedding landed. Second code review found and fixed 4 bugs in metadata embedder + ingest cache-hit path.
 
 ## Reference documents
 
@@ -29,7 +29,7 @@ Plan doc has full design details (§1-12), test matrix (34 cases across 6 groups
 - **Concurrency is internal to the localizer.** Download pool = `min(4, mmCfg.concurrency)`; caption pool = `mmCfg.concurrency`. No public API surface.
 - **Codex-CLI:** downloads + rewrites still run; caption step skipped; alt stays original.
 
-### From v3 revision (2026-07-23 afternoon, this session)
+### From v3 revision (2026-07-23 afternoon)
 
 - **Two-axis decision matrix (§1 of plan):** URL kind × author alt. VLM runs only when alt is empty (and image is over threshold, on a captionable URL kind). Non-empty author alt is preserved verbatim — accessibility work belongs to the author.
 - **Two-form body output:** `LocalizeResult` returns both `rewrittenSourceMarkdown` (source-root-relative, e.g. `<source-root>/wiki/media/…`) and `rewrittenWikiMarkdown` (wiki-root-relative, e.g. `<wiki-root>/media/…`). Neither can be derived from the other.
@@ -157,6 +157,18 @@ New module `src/lib/image-metadata-embed.ts` + 15 tests. Writes VLM alt/title in
 - SVG: `<metadata>` XMP RDF/XML + `<title>` + `<desc>`
 
 Integrated as Phase 3 loop in `localizeMarkdownImages` (after VLM captioning, before `savedImages` construction). Non-fatal. `ingest.ts` log gains `meta-embed` counter.
+
+### [x] Second code review — bug fixes (2026-07-26, uncommitted)
+
+Full review of the branch (~7,300 lines, 21 files). Found and fixed 4 bugs + 1 pre-existing type error:
+
+1. **EXIF TIFF offset error** (`image-metadata-embed.ts:618`): `off += 4` after a 2-byte `setUint16` write → IFD entry 14 bytes instead of 12, corrupting all WebP EXIF metadata. Fixed: `off += 2`.
+2. **IPTC IIM buffer underallocation** (`image-metadata-embed.ts:216`): `nameLen = 1` but code writes 2 bytes (Pascal string count + pad). Fixed: `nameLen = 2`.
+3. **SVG with XML declaration silently skipped** (`image-metadata-embed.ts:509`): `indexOf(">")` hit `<?xml?>` closing, regex failed. Fixed: `search(/<svg[\s>]/i)` + `indexOf(">", svgTagStart)`.
+4. **Cache-hit branch drops localized images** (`ingest.ts:860`): missing `else { savedImages = [...savedImages, ...markdownLocalizedImages] }` — re-ingest lost all localized images. Fixed.
+5. **Pre-existing type error** (`image-metadata-embed.test.ts:134`): mock didn't satisfy `FileBase64` interface. Fixed: added `mimeType`, removed extraneous `path`.
+
+Verification: `npm run typecheck` clean, `npm run build` clean, 158/158 localizer+metadata tests pass, full suite 1877 pass (6 pre-existing env failures unchanged).
 
 ## Open review items (not yet addressed)
 

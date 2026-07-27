@@ -1,10 +1,10 @@
 ---
 kind: context
-last_updated: '2026-07-26T10:33:13+00:00'
+last_updated: '2026-07-27T01:09:26+00:00'
 last_writer: hand-off
-last_agent: hermes-devops
-session_id: handoff-20260726
-last_verified: '2026-07-26T10:33:13+00:00'
+last_agent: hermes-agent
+session_id: hermes-default
+last_verified: '2026-07-27T01:09:26+00:00'
 ---
 
 # Context — llm-wiki
@@ -16,15 +16,16 @@ Session-independent invariants for the `feat/markdown-image-localizer` work.
 - Repo root: `C:\Users\jinnn\Documents\llm-wiki` [git:origin]
 - Fork of `nashsu/llm_wiki` (upstream). Working branch `main` mirrors `origin/main`; `upstream` branch mirrors `nashsu/main`. [git:remote]
 - Layout convention: `main` is rolling mirror of `origin/main` which may be ahead of `origin/upstream` (fork sometimes pulls community PRs before upstream releases them). Currently `main` = `upstream` = `e8bdec6` (v0.6.5 tip). [git:log]
-- Active feature branch: `feat/markdown-image-localizer`, cut from `e8bdec6`. Head is `3cda623` (Phase 3 metadata embedding). 12 commits total on branch. [git:branch]
+- Active feature branch: `feat/markdown-image-localizer`, cut from `e8bdec6`. Head is `c154236` (handoff doc commit). 13 commits total on branch. 3 additional files modified but uncommitted (second code review fixes). [git:branch]
 - Package manager: npm. Verify commands: `npm run test`, `npm run typecheck`, `npm run build`. [user:workspace-snapshot]
 - Test framework: vitest. [git:package.json]
 - Node 24.15.0, TypeScript strict. [user:profile]
 
 ## Toolchain state at session end
 
-- GitNexus index: current as of `c2f626d` (a merge commit that got reset). After the reset to `e8bdec6`, index has 6,696 nodes / 17,677 edges / 456 communities. Contents match `e8bdec6` because tree was byte-identical to the merge commit. Index is now stale relative to branch head `3cda623`. [test:gitnexus-analyze-log]
+- GitNexus index: stale relative to branch head (last indexed at `e8bdec6` tree state). 6,696 nodes / 17,677 edges / 456 communities. [test:gitnexus-analyze-log]
 - Working tree carries two files that predate this feature branch and should not be assumed as branch changes: `M package-lock.json` and untracked `CLAUDE.md`. [git:status]
+- Three files modified by second code review, uncommitted: `src/lib/image-metadata-embed.ts`, `src/lib/ingest.ts`, `src/lib/image-metadata-embed.test.ts`. [git:status]
 
 ## Framing invariants (locked, from post-review round v2 + v3)
 
@@ -52,7 +53,7 @@ Session-independent invariants for the `feat/markdown-image-localizer` work.
 
 ## Metadata embedding module (Phase 3, added 2026-07-26)
 
-- `src/lib/image-metadata-embed.ts` — pure byte-manipulation module, zero external deps. Exports `embedImageMetadata({ absPath, alt, title, mimeType }) → { written, format, error? }`. [git:blob]
+- `src/lib/image-metadata-embed.ts` — pure byte-manipulation module, zero external deps. Exports `embedImageMetadata({ absPath, alt, title, mimeType }) → { written, skipReason? }`. [git:blob]
 - Supported formats: JPEG (APP1 XMP + APP13 IPTC IIM), PNG (iTXt + XMP chunk), WebP (VP8X + EXIF + XMP), SVG (`<metadata>` XMP + `<title>` + `<desc>`). [user:decision-2026-07-26]
 - Explicitly excluded: RAW, BMP, GIF (user constraint). AVIF, HEIC, TIFF, ICO skipped (ISOBMFF complexity / niche). [user:decision-2026-07-26]
 - Multi-vendor field duplication: same alt/title written to multiple metadata fields per format for maximum reader compatibility (e.g. JPEG gets `dc:description` + `dc:title` + `AltTextAccessibility` + IPTC `Caption-Abstract` + `Headline`). [user:decision-2026-07-26]
@@ -61,6 +62,14 @@ Session-independent invariants for the `feat/markdown-image-localizer` work.
 - Integration point: Phase 3 loop in `localizeMarkdownImages`, after VLM captioning, before `savedImages` construction. Only runs for `vlmOutcome === "captioned" | "cache-hit"`. Non-fatal — errors counted in `stats.metadataSkipped`. [git:blob]
 - `LocalizeResult.stats` gained `metadataEmbedded` and `metadataSkipped` counters. `ingest.ts` log line includes `meta-embed` count. [git:blob]
 - `sha8OfBytes` export preserved in `markdown-image-localizer.ts` despite internal dedup to `sha256Hex` — tests import it directly (`markdown-image-localizer.test.ts:32`). [git:blob]
+
+## Second code review findings (2026-07-26 evening, fixes applied)
+
+- **EXIF TIFF builder** (`buildExifTiff`): IFD entries are exactly 12 bytes (tag:2 + type:2 + count:4 + value:4). A `setUint16` write must advance offset by 2, not 4. The original code had `off += 4` after the type field write, producing 14-byte entries and corrupting all downstream offsets. [test:second-code-review]
+- **IPTC IIM builder** (`buildIptcIim`): Photoshop IRB Pascal string name for empty name is 2 bytes (count=0 + pad byte), not 1. The `nameLen` constant must match what the code actually writes at lines 233-234. [test:second-code-review]
+- **SVG embedding** (`embedSvg`): Must use `text.search(/<svg[\s>]/i)` to find the `<svg` tag start before calling `indexOf(">")`. A bare `indexOf(">")` hits `<?xml?>` closing brackets in SVGs with XML declarations. [test:second-code-review]
+- **Ingest cache-hit branch**: When localizer is enabled, both the cache-hit and full-pipeline branches must add `markdownLocalizedImages` to `savedImages`. The cache-hit branch was missing the `else` clause, causing re-ingest to lose all localized images from downstream caption + source-summary injection. [test:second-code-review]
+- **`FileBase64` interface** (`src/commands/fs.ts:203`): requires `{ base64: string; mimeType: string }`. Test mocks must satisfy both fields. [git:blob]
 
 ## Caches on disk
 
