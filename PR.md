@@ -10,10 +10,10 @@
 
 | 指标 | 值 |
 |------|-----|
-| 提交 | 22 commits（含 3 轮 code review 修复）+ 本轮未提交改动 |
-| 新增/删除 | +7,429 / −55 行（已提交）+ 本轮增量 |
-| 文件 | 21 个（10 个源码 + 4 个测试 + 7 个文档/配置）+ 本轮 17 个文件 |
-| 新测试 | 2,895 行，1,874 个测试用例全部通过 |
+| 提交 | 27 commits（含 3 轮 code review 修复 + settings UI + rebase onto v0.6.6） |
+| 新增/删除 | +7,925 / −76 行 |
+| 文件 | 30 个（10 个源码 + 5 个测试 + 8 个文档/配置 + 7 个 handoff/plan） |
+| 新测试 | 1,887 个测试用例全部通过（含上游 v0.6.6 新增 13 个） |
 
 ## 架构
 
@@ -181,17 +181,17 @@ Accept-Language: zh-CN,zh;q=0.9,en;q=0.8
 ## 测试
 
 ```
-Test Files  5 passed (5)
-     Tests  169 passed (169)    ← 本轮直接相关（含元数据嵌入集成验证）
+Test Files  121 passed (121)
+     Tests  1,887 passed (1,887)
 ```
 
-全量测试：~1,877 个通过；6 个失败为 `main` 分支已有的 TCP 环境测试（`llm-client.real-llm.test.ts`、`embedding.real-llm.test.ts`），与本分支无关（已通过 `git stash` 在 base commit 上复现确认）。
+全量测试在 rebase onto upstream v0.6.6 后全部通过（含上游新增的 13 个测试）。本分支直接相关的 localizer / metadata / vision-caption 测试共 169 个。
 
 ## 验证清单
 
 - [x] `npm run typecheck` — 通过
 - [x] `npm run build` — 通过
-- [x] 本轮相关测试 169/169 通过
+- [x] 全量测试 121 文件 / 1,887 用例全部通过
 - [x] 3 轮 code review 修复已提交
 - [x] 无新增外部依赖（纯字节操作，无 exiftool 等）
 - [x] Settings UI 开关已接入
@@ -200,6 +200,7 @@ Test Files  5 passed (5)
 - [x] CAPTION_PROMPT 无内部矛盾（纯文本 + 单段落 + 无推测）
 - [x] 元数据嵌入在集成测试中真正执行并断言
 - [x] Localizer 失败时正确回退 legacy 管线（`localizerRan` 标志）
+- [x] Rebase onto upstream v0.6.6（19 commits）— 冲突已解决，验证通过
 
 ## 已知限制
 
@@ -209,53 +210,39 @@ Test Files  5 passed (5)
 - Caption 缓存为多写者 JSON（`image-caption-pipeline.ts` + localizer），last-writer-wins，无文件锁
 - 平台级图片封锁（cookie 门控、签名 URL、登录墙）超出通用 Header 能力，图片跳过并记录失败
 
-## 本轮未提交改动（17 个文件）
-
-```
-M  src/components/settings/sections/multimodal-section.tsx   ← UI 开关
-M  src/components/settings/settings-types.ts                 ← draft 字段
-M  src/components/settings/settings-view.tsx                 ← 初始化/保存
-M  src/i18n/en.json                                          ← 翻译键
-M  src/i18n/zh.json                                          ← 翻译键
-M  src/lib/image-metadata-embed.ts                           ← IRB padding 注释精确化
-M  src/lib/ingest.ts                                         ← localizerRan 回退 + cache trade-off 注释
-M  src/lib/markdown-image-localizer.test.ts                  ← 元数据嵌入集成断言
-M  src/lib/markdown-image-localizer.ts                       ← splitCaption JSDoc 对齐
-M  src/lib/project-store.ts                                  ← normalizeMultimodalConfig
-M  src/lib/url-source-import.ts                              ← headers 参数
-M  src/lib/vision-caption.ts                                 ← 5 维 factual prompt（无推测/纯文本）
-M  src/lib/vision-caption.test.ts                            ← 回归守卫 + 负向断言
-M  context.md / task.md / walkthrough.md / questions.md      ← handoff 文档
-```
-
 ## 提交历史
 
 <details>
-<summary>22 commits（点击展开）</summary>
+<summary>27 commits（点击展开）</summary>
 
 ```
-7c23499 fix(localizer): third code review — base64ToBytes dedup, PNG unsigned shift, WebP null-dims, SVG xml-decl insert, shouldLocalize hoist
-cfda49d fix(localizer): second code review — EXIF offset, IPTC buffer, SVG xml-decl, cache-hit images
-c154236 docs(handoff): session hand-off — Phase 3 metadata embedding complete
-3cda623 feat(localizer): Phase 3 — embed VLM alt/title into image file metadata
-2182625 fix(localizer): code review fixes — H1 CRLF offset, H3 AbortSignal fallback, M1/M2 dedup SHA-256
-0c6d10b feat(ingest): commit 5 — Step 0.4 localizer integration + working-content propagation
-f246260 docs(localizer): commit 4 tail — wiki-page seeding audit (§8)
-544a788 feat(localizer): commit 4c — mergeImageSourcesFrontmatter (§11 lifecycle)
-b8e3a8e feat(localizer): commit 4b — VLM decision matrix + provider gate + threshold + concurrency
-f02260f feat(localizer): commit 4a — rewriteBySlot + two-form path helper + §7 escape/sanitize
-bb7fd20 feat(localizer): commit 3c — HTTP fetch + data URI + main pipeline
-80e037f feat(localizer): commit 3b — URL cache data layer + sha8
-eacc4ea feat(localizer): commit 3a — module skeleton (types, regex, classify)
-8e13770 feat(localizer): commit 2 — CaptionEntry optional forward-compat fields
-234f0e2 feat(localizer): commit 1 — scaffold for markdown image localizer
-dc86753 docs(handoff): plan v3.3 — SMALL detail cleanup + mmCfg scope hoist
-43aa296 docs(handoff): plan v3.2 — WORTH refinements (W1–W6 from review round 3)
-38aa233 docs(handoff): plan v3.1 — spec-vs-code alignment (C1–C4 from review round 3)
-c1987be docs(handoff): plan v3 — respect existing alt/title + fix review round 2 findings
-85fb659 docs(handoff): session hand-off — spec revised post review
-c696737 docs(handoff): revise plan post design review
-c2448fd docs(handoff): session hand-off — spec + branch cut
+03d6832 chore(deps): regenerate package-lock.json after rebase onto upstream v0.6.6
+d7dd210 docs(handoff): session hand-off — code review round 4 complete + PR.md updated
+ad77cbf test(localizer): exercise metadata embedding in integration tests + JSDoc/comment alignment
+7ccb271 fix(caption): remove format contradiction + speculation from CAPTION_PROMPT; fix(ingest): localizerRan fallback flag
+c95f005 feat(settings): localizeMarkdownImages UI toggle + config hydration + generic fetch headers + outputLanguage passthrough
+6925771 fix(localizer): third code review — base64ToBytes dedup, PNG unsigned shift, WebP null-dims, SVG xml-decl insert, shouldLocalize hoist
+4bc42c5 fix(localizer): second code review — EXIF offset, IPTC buffer, SVG xml-decl, cache-hit images
+8814a6b docs(handoff): session hand-off — Phase 3 metadata embedding complete
+e55579d feat(localizer): Phase 3 — embed VLM alt/title into image file metadata
+5ea51b7 fix(localizer): code review fixes — H1 CRLF offset, H3 AbortSignal fallback, M1/M2 dedup SHA-256
+d2dc01c feat(ingest): commit 5 — Step 0.4 localizer integration + working-content propagation
+7b4a7a1 docs(localizer): commit 4 tail — wiki-page seeding audit (§8)
+4813f48 feat(localizer): commit 4c — mergeImageSourcesFrontmatter (§11 lifecycle)
+e264480 feat(localizer): commit 4b — VLM decision matrix + provider gate + threshold + concurrency
+e018e25 feat(localizer): commit 4a — rewriteBySlot + two-form path helper + §7 escape/sanitize
+3c99d37 feat(localizer): commit 3c — HTTP fetch + data URI + main pipeline
+7ba357b feat(localizer): commit 3b — URL cache data layer + sha8
+1ff3661 feat(localizer): commit 3a — module skeleton (types, regex, classify)
+728d62c feat(localizer): commit 2 — CaptionEntry optional forward-compat fields
+36e08cb feat(localizer): commit 1 — scaffold for markdown image localizer
+3b87fb6 docs(handoff): plan v3.3 — SMALL detail cleanup + mmCfg scope hoist
+a55263f docs(handoff): plan v3.2 — WORTH refinements (W1–W6 from review round 3)
+ceb171d docs(handoff): plan v3.1 — spec-vs-code alignment (C1–C4 from review round 3)
+996da01 docs(handoff): plan v3 — respect existing alt/title + fix review round 2 findings
+5c07aa7 docs(handoff): session hand-off — spec revised post review
+21d52c2 docs(handoff): revise plan post design review
+8ee940c docs(handoff): session hand-off — spec + branch cut
 ```
 
 </details>
