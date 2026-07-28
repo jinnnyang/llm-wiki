@@ -1,13 +1,93 @@
 ---
 kind: walkthrough
-last_updated: '2026-07-27T01:09:35+00:00'
+last_updated: '2026-07-28T01:34:57+00:00'
+last_verified: '2026-07-28T01:34:41+00:00'
 last_writer: hand-off
-last_agent: hermes-agent
+last_agent: hermes
 session_id: hermes-default
-last_verified: '2026-07-27T01:09:25+00:00'
 ---
 
 # Walkthrough — llm-wiki
+
+## 2026-07-28 (evening) — Code review 第 4 轮：CAPTION_PROMPT 矛盾修复 + 容错 + 测试补全
+
+### 背景
+
+对分支进行完整代码评审，发现 6 个问题（1 严重 / 2 中等 / 3 低）。本轮全部修复。
+
+### 决策
+
+- **CAPTION_PROMPT 格式矛盾（🔴 严重）**：旧 prompt 同时要求 "Mermaid/Markdown 表格/fenced code block" 和 "single flowing paragraph, no line breaks"——不可同时满足。且 `formatImageAlt` 只转义 `]` 和换行，Markdown 语法会破坏周围文档。**决策**：删除所有结构化输出建议，明确要求 "plain text, no Markdown formatting"。
+- **CAPTION_PROMPT speculation（🔴 严重）**：旧 prompt 的 "Reasonable inference / Mark uncertainty ('perhaps', 'possibly')" 维度与文件自身记录的 ablation 结论矛盾（该模式对知识库场景产生有害幻觉）。**决策**：删除推测维度，新增显式约束 "Describe only what is directly observable. Do not speculate..."。维度从 6 个减为 5 个。
+- **旧 JSDoc 死注释**：:44-68 的注释块描述旧 prompt（"2-4 sentences, no markdown"），与当前 prompt 完全矛盾。**决策**：合并为单一 JSDoc，与 prompt 一致。
+- **cache-hit 图片丢失（🟡 中等）**：localizer 抛异常时 `shouldLocalize` 仍为 `true`，gate 跳过 legacy extractor，图片丢失。**决策**：引入 `localizerRan` 标志，仅在成功时置 `true`，两处 gate 改用该标志。
+- **元数据嵌入集成测试缺失（🟡 中等）**：localizer 测试未 mock `readFileAsBase64`，embed 静默失败。**决策**：添加默认 mock（返回有效 1×1 PNG）+ 正向断言（`metadataEmbedded === 1`、`writeFileBase64` 调用 2 次）。
+- **splitCaption JSDoc 错误**：声称 "one line ≤ 100 chars"，实际 prompt 说 ~300-1000 chars。**决策**：对齐为 "single flowing paragraph"。
+- **IRB padding 注释**：精确化——12 字节固定头始终为偶数，奇偶性完全由 IIM 载荷决定。
+- **buildIngestHashInput trade-off**：诚实记录 `minImagePixelSize` 确实改变输出，但 per-image SHA-256 caption 缓存会自动补全，无需全文档 re-ingest。
+
+### 改动文件（17 个，均未提交）
+
+- `src/lib/vision-caption.ts` — 5 维 factual prompt（无推测/纯文本/单段落）+ 合并 JSDoc
+- `src/lib/vision-caption.test.ts` — 回归守卫 + 负向断言（禁止旧指令回归）
+- `src/lib/ingest.ts` — `localizerRan` 标志 + cache trade-off 注释
+- `src/lib/markdown-image-localizer.ts` — splitCaption JSDoc 对齐
+- `src/lib/markdown-image-localizer.test.ts` — readFileAsBase64 默认 mock + embed 正向断言
+- `src/lib/image-metadata-embed.ts` — IRB padding 注释精确化
+- `PR.md` — 全面更新为真实现状
+- 其余 10 个文件为上一 session 遗留（Settings UI、i18n、project-store 等）
+
+### 验证
+
+- `npm run typecheck` ✅
+- `npm run build` ✅
+- 169/169 相关测试通过 ✅
+- 6 个全量失败为 base commit 已有的 TCP 环境测试（`git stash` 验证确认）
+
+### 意外发现
+
+- 上一 session 的 `.handoff.lock` 残留导致 preflight 报 HARD conflict，手动删除后恢复。
+
+## 2026-07-28 — Caption 语言跟随 + 软指导 prompt + 通用 Header
+
+### 背景
+
+用户测试发现两个问题：
+1. VLM caption 输出为英文，但 Wiki 设置了中文输出语言
+2. 微信图片下载失败（之前用域名特判 Referer，用户明确不要反盗链特判）
+
+用户同时提出 caption prompt 设计方向：软约束建议、不僵化、长度软目标（~300 字，上限 ~1024）。
+
+### 决策
+
+- **语言跟随**：`outputLanguage` 从 wiki-store 一路传到 `captionImage()`，prompt 尾部追加 `"Write your description in {lang}."`。`"auto"` 或不设则模型自动匹配。复用 `getLanguagePromptName()`。
+- **Prompt 重构**：旧 prompt 是命令式（"Do NOT speculate, no markdown"），新 prompt 是建议式（"Consider these aspects as appropriate, use your judgment"）。
+- **通用 Header**：去掉 `mmbiz.qpic.cn` 域名特判，所有图片请求统一发 UA + Accept + Accept-Language。用户原话："不需要考虑反盗链，只需要做好通用的 Header 检测就好"。
+- **配置水合**：`normalizeMultimodalConfig()` 修复旧 `app-state.json` 缺 `localizeMarkdownImages` 字段导致功能静默关闭。
+- **VLM 配置修复**：`ingest.ts` 原来把主 `llmConfig` 直接传给 localizer，而非 `resolveCaptionConfig()` 解析后的 `captionLlm`。已修复为 `captionLlm ?? llmConfig`。
+
+> **注意**：本 session 最初实现了 6 维 prompt（含 "合理推测" + "格式自适应 Mermaid/表格/代码块"），但当晚 code review 第 4 轮发现这些与下游契约矛盾，已修正为 5 维纯文本 prompt。见上一条 walkthrough。
+
+### 改动文件（11 个，均未提交）
+
+| 文件 | 改动 |
+|------|------|
+| `vision-caption.ts` | 软指导 prompt + `outputLanguage` 参数 + 语言指令 |
+| `vision-caption.test.ts` | 回归守卫适配新 prompt |
+| `markdown-image-localizer.ts` | 通用 Header + `outputLanguage` 透传 |
+| `ingest.ts` | 传 `captionLlm ?? llmConfig` + `outputLanguage` |
+| `url-source-import.ts` | `fetchImportUrl` 增加 `headers` 参数 |
+| `project-store.ts` | `normalizeMultimodalConfig()` |
+| `settings-types.ts` | `multimodalLocalizeImages` draft 字段 |
+| `settings-view.tsx` | 初始化/保存连接 |
+| `multimodal-section.tsx` | UI 开关 |
+| `zh.json` / `en.json` | 翻译键 |
+
+### 验证
+
+- 157/157 测试通过（vision-caption + localizer + scaffold + url-source-import）
+- `npm run build:desktop` 成功
+- 未执行 `tauri build`（二进制未重编译）
 
 ## 2026-07-26 (evening) — Second code review: 4 bugs fixed in metadata embedder + ingest
 

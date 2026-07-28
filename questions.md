@@ -1,10 +1,10 @@
 ---
 kind: questions
-last_updated: '2026-07-27T01:09:35+00:00'
+last_updated: '2026-07-28T01:34:57+00:00'
+last_verified: '2026-07-28T01:34:42+00:00'
 last_writer: hand-off
-last_agent: hermes-agent
+last_agent: hermes
 session_id: hermes-default
-last_verified: '2026-07-27T01:09:26+00:00'
 ---
 
 # Questions
@@ -23,6 +23,15 @@ last_verified: '2026-07-27T01:09:26+00:00'
 
 ## Open
 
+### Commit 本轮 17 个文件改动 · 2026-07-28
+
+17 个文件已修改但未提交。建议拆为 3 个 commit：
+1. `fix(caption): remove format contradiction + speculation from CAPTION_PROMPT — 5-dim factual, plain text, single paragraph`
+2. `fix(ingest): localizerRan flag — fall back to legacy extractor on localizer failure`
+3. `test(localizer): exercise metadata embedding in integration tests + JSDoc/comment alignment`
+
+PR.md 已同步更新。
+
 ### H2 product decision · localizeMarkdownImages default · 2026-07-26
 
 <!-- keep -->
@@ -34,12 +43,6 @@ last_verified: '2026-07-27T01:09:26+00:00'
 3. Default `true` + first-run prompt in Settings UI (Phase 3) — best UX but requires UI work.
 
 No decision made yet. Current code ships with `true`.
-
-### Commit the second-review bug fixes · 2026-07-26
-
-<!-- keep -->
-
-Three files modified (uncommitted): `image-metadata-embed.ts`, `ingest.ts`, `image-metadata-embed.test.ts`. Suggested commit message: `fix(localizer): second code review — EXIF offset, IPTC buffer, SVG xml-decl, cache-hit images`. User hasn't confirmed yet.
 
 ## Closed
 
@@ -69,3 +72,17 @@ take-over Step 2 check-reality flagged 2 HARD conflicts of type `missing_file_in
 Not real path references. Force-continue accepted. Fixed in task.md by replacing with `<source-root>/wiki/media/…` placeholder notation. <!-- resolved -->
 
 - None.
+### Commit 本轮 11 个文件改动 · 2026-07-28
+
+<!-- resolved -->
+
+Superseded by the 17-file commit entry above (same files + 6 more from code review round 4).
+
+### Commit the second-review bug fixes · 2026-07-26
+
+<!-- resolved -->
+
+Three files modified (uncommitted): `image-metadata-embed.ts`, `ingest.ts`, `image-metadata-embed.test.ts`. Suggested commit message: `fix(localizer): second code review — EXIF offset, IPTC buffer, SVG xml-decl, cache-hit images`. User hasn't confirmed yet.
+
+**Resolution**: Committed as `cfda49d`. Third review fixes also committed as `7c23499`.
+

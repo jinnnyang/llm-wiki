@@ -1,10 +1,10 @@
 ---
 kind: context
-last_updated: '2026-07-27T01:09:26+00:00'
+last_updated: '2026-07-28T01:34:42+00:00'
+last_verified: '2026-07-28T01:34:42+00:00'
 last_writer: hand-off
-last_agent: hermes-agent
+last_agent: hermes
 session_id: hermes-default
-last_verified: '2026-07-27T01:09:26+00:00'
 ---
 
 # Context — llm-wiki
@@ -16,7 +16,7 @@ Session-independent invariants for the `feat/markdown-image-localizer` work.
 - Repo root: `C:\Users\jinnn\Documents\llm-wiki` [git:origin]
 - Fork of `nashsu/llm_wiki` (upstream). Working branch `main` mirrors `origin/main`; `upstream` branch mirrors `nashsu/main`. [git:remote]
 - Layout convention: `main` is rolling mirror of `origin/main` which may be ahead of `origin/upstream` (fork sometimes pulls community PRs before upstream releases them). Currently `main` = `upstream` = `e8bdec6` (v0.6.5 tip). [git:log]
-- Active feature branch: `feat/markdown-image-localizer`, cut from `e8bdec6`. Head is `c154236` (handoff doc commit). 13 commits total on branch. 3 additional files modified but uncommitted (second code review fixes). [git:branch]
+- Active feature branch: `feat/markdown-image-localizer`, cut from `e8bdec6`. Head is `7c23499` (third code review commit). 22 commits total on branch. 17 files modified but uncommitted (caption-lang session + code review round 4). [git:branch]
 - Package manager: npm. Verify commands: `npm run test`, `npm run typecheck`, `npm run build`. [user:workspace-snapshot]
 - Test framework: vitest. [git:package.json]
 - Node 24.15.0, TypeScript strict. [user:profile]
@@ -25,7 +25,8 @@ Session-independent invariants for the `feat/markdown-image-localizer` work.
 
 - GitNexus index: stale relative to branch head (last indexed at `e8bdec6` tree state). 6,696 nodes / 17,677 edges / 456 communities. [test:gitnexus-analyze-log]
 - Working tree carries two files that predate this feature branch and should not be assumed as branch changes: `M package-lock.json` and untracked `CLAUDE.md`. [git:status]
-- Three files modified by second code review, uncommitted: `src/lib/image-metadata-embed.ts`, `src/lib/ingest.ts`, `src/lib/image-metadata-embed.test.ts`. [git:status]
+- Second + third code review fixes committed: `cfda49d`, `7c23499`. [git:log]
+- 17 files modified but uncommitted (2026-07-28 sessions): Settings UI toggle, normalizeMultimodalConfig, captionLlm fix, generic headers, soft-guidance 5-dim prompt, outputLanguage, localizerRan flag, metadata embed integration tests, JSDoc/comment alignment, PR.md. [git:status]
 
 ## Framing invariants (locked, from post-review round v2 + v3)
 
@@ -34,12 +35,20 @@ Session-independent invariants for the `feat/markdown-image-localizer` work.
 - Master toggle `multimodalConfig.localizeMarkdownImages: boolean` (default `true`). Enables the entire Step 0.4 pipeline; disable = byte-identical to pre-v0.6.6. [user:decision-2026-07-23-review]
 - **Accessibility metadata is user work.** VLM captioning is a gap-filler, not a rewriter. The v3 decision matrix (§1 of plan) gates VLM on `alt` being empty — non-empty author alt is preserved verbatim; VLM never runs on it. This differs from the PDF/DOCX path where `captionMarkdownImages` still overwrites placeholders (correct for those sources; no author alt exists there). [user:decision-2026-07-23-v3]
 
+## Caption prompt invariants (locked, code review round 4)
+
+- **CAPTION_PROMPT is 5 dimensions, not 6.** The "Reasonable inference / Mark uncertainty" dimension was removed — ablation proved it produces harmful hallucinations for knowledge-base content (charts, screenshots, flowcharts). [test:code-review-round-4]
+- **Plain text only, no Markdown formatting.** The prompt explicitly bans tables, code fences, bullet lists, Mermaid. Reason: `formatImageAlt` only escapes `]` and newlines; pipes, backticks, and other Markdown syntax would corrupt the surrounding `![alt](url)`. [test:code-review-round-4]
+- **Single flowing paragraph, no line breaks.** This ensures `splitCaptionIntoAltAndTitle` returns alt=full text, title=undefined. The multi-line branch in that function is a defensive fallback, not a design target. [test:code-review-round-4]
+- **No speculation.** "Describe only what is directly observable. Do not speculate about causes, narratives, or intentions beyond what the image explicitly shows." [test:code-review-round-4]
+- **Regression guard** in `vision-caption.test.ts` includes negative assertions: `not.toMatch(/Mark uncertainty/)`, `not.toMatch(/Mermaid/)`, `not.toMatch(/fenced code block/)`. [git:blob]
+
 ## Image pipeline landmarks (predecessor v0.6.4 work)
 
 - `src/lib/image-caption-pipeline.ts:283` — `captionMarkdownImages`, the VLM caption orchestrator for PDF/DOCX-extracted images. Does aggressive alt overwrite; that's correct for those sources. Not called from the new localizer path. [git:blob]
 - `src/lib/image-caption-pipeline.ts:141` — `MD_IMAGE_RE`. Does NOT capture `"title"`; splits url at whitespace. Do not modify — the new module ships an extended regex `MD_IMAGE_RE_WITH_TITLE` alongside it. [git:blob]
 - `src/lib/vision-caption.ts` — `captionImage(imageBase64, mediaType, llmConfig, signal, options)`. Codex-CLI transport is a no-op (early return). [git:blob]
-- `src/lib/extract-source-images.ts:200` — `extractAndSaveMarkdownImages` handles **local relative** md image refs today. When `localizeMarkdownImages` is enabled, this call is **skipped** at both call sites in `ingest.ts` (~738 and ~836); the new localizer's `local-relative` classification covers the same job plus VLM captioning. When the master toggle is off, the legacy call still runs. [user:decision-2026-07-23-v3]
+- `src/lib/extract-source-images.ts:200` — `extractAndSaveMarkdownImages` handles **local relative** md image refs today. When `localizeMarkdownImages` is enabled AND the localizer ran successfully (`localizerRan === true`), this call is **skipped** at both call sites in `ingest.ts`; the new localizer's `local-relative` classification covers the same job plus VLM captioning. When the master toggle is off OR the localizer threw, the legacy call still runs. [user:decision-2026-07-23-v3, test:code-review-round-4]
 - `src/lib/url-source-import.ts:86` — `fetchImportUrl` with SSRF/private-network/redirect defenses. Reuse verbatim. [git:blob]
 - `src/lib/tauri-fetch.ts:41` — `getHttpFetch` wrapper. [git:blob]
 - `src/commands/fs.ts` — `writeFileBase64(path, base64)` → Rust `write_file_base64`. Also `readFileAsBase64(path)` → Rust `read_file_base64`. [git:blob]
@@ -62,6 +71,7 @@ Session-independent invariants for the `feat/markdown-image-localizer` work.
 - Integration point: Phase 3 loop in `localizeMarkdownImages`, after VLM captioning, before `savedImages` construction. Only runs for `vlmOutcome === "captioned" | "cache-hit"`. Non-fatal — errors counted in `stats.metadataSkipped`. [git:blob]
 - `LocalizeResult.stats` gained `metadataEmbedded` and `metadataSkipped` counters. `ingest.ts` log line includes `meta-embed` count. [git:blob]
 - `sha8OfBytes` export preserved in `markdown-image-localizer.ts` despite internal dedup to `sha256Hex` — tests import it directly (`markdown-image-localizer.test.ts:32`). [git:blob]
+- **Integration test coverage**: `markdown-image-localizer.test.ts` now mocks `readFileAsBase64` with a valid 1×1 PNG default, so Phase 3 embedding actually runs in VLM tests. Test 3 asserts `metadataEmbedded === 1` and `writeFileBase64` called twice (initial save + embed write-back). [test:code-review-round-4]
 
 ## Second code review findings (2026-07-26 evening, fixes applied)
 
@@ -70,6 +80,15 @@ Session-independent invariants for the `feat/markdown-image-localizer` work.
 - **SVG embedding** (`embedSvg`): Must use `text.search(/<svg[\s>]/i)` to find the `<svg` tag start before calling `indexOf(">")`. A bare `indexOf(">")` hits `<?xml?>` closing brackets in SVGs with XML declarations. [test:second-code-review]
 - **Ingest cache-hit branch**: When localizer is enabled, both the cache-hit and full-pipeline branches must add `markdownLocalizedImages` to `savedImages`. The cache-hit branch was missing the `else` clause, causing re-ingest to lose all localized images from downstream caption + source-summary injection. [test:second-code-review]
 - **`FileBase64` interface** (`src/commands/fs.ts:203`): requires `{ base64: string; mimeType: string }`. Test mocks must satisfy both fields. [git:blob]
+
+## Fourth code review findings (2026-07-28 evening, fixes applied)
+
+- **CAPTION_PROMPT format contradiction**: prompt simultaneously encouraged Mermaid/MD-table/fenced-block output AND required "single flowing paragraph, no line breaks". Removed structured-output suggestions; added explicit "no Markdown formatting" ban. [test:code-review-round-4]
+- **CAPTION_PROMPT speculation**: "Reasonable inference / Mark uncertainty" dimension contradicted the file's own ablation record. Removed; added explicit no-speculation constraint. 6 dims → 5 dims. [test:code-review-round-4]
+- **Stale JSDoc**: :44-68 described the old prompt ("2-4 sentences, no markdown"). Merged into a single JSDoc block consistent with the current prompt. [test:code-review-round-4]
+- **cache-hit image loss on localizer failure**: `shouldLocalize` stayed `true` after a throw, so the gate skipped the legacy extractor and images were silently dropped. Fixed with `localizerRan` flag (set only on success); both gates now use it. [test:code-review-round-4]
+- **Metadata embedding untested in integration**: localizer tests never mocked `readFileAsBase64`, so embed silently failed in every VLM test. Added default mock + positive assertions. [test:code-review-round-4]
+- **splitCaption JSDoc**: claimed "one line ≤ 100 chars"; aligned to "single flowing paragraph" matching the prompt's ~300-1000 char guidance. [test:code-review-round-4]
 
 ## Caches on disk
 
@@ -91,9 +110,10 @@ Session-independent invariants for the `feat/markdown-image-localizer` work.
 - 20 MB body size cap on image downloads. Content-Type must start with `image/`. **Content-Length preflight** rejects before body read when the header is present. Same 20 MB cap applies to decoded data URIs. [plan:markdown-image-localizer.md]
 - Timeout: 30s (configurable via `multimodalConfig.imageFetchTimeoutMs`). CJK-locale networks need more headroom than 15s. [user:decision-2026-07-23-v3]
 - Concurrency internalized: download pool = `min(4, multimodalConfig.concurrency)`; caption pool = `multimodalConfig.concurrency`; copyFile pool = unlimited. Not on public API. [user:decision-2026-07-23-review]
-- Cache-key fingerprint folds in only the `localizeMarkdownImages` enable/disable toggle; `minImagePixelSize` and `urlCacheTtlDays` are NOT part of the fingerprint. [user:decision-2026-07-23-review]
+- Cache-key fingerprint folds in only the `localizeMarkdownImages` enable/disable toggle; `minImagePixelSize` and `urlCacheTtlDays` are NOT part of the fingerprint. Trade-off: lowering `minImagePixelSize` changes output (small images get captions) but per-image SHA-256 caption cache auto-fills on next encounter; full re-ingest not warranted. [user:decision-2026-07-23-review, test:code-review-round-4]
 - Step 0.4 placement: **before `checkIngestCache`**, uniform. Cache convergence via **`workingSourceContent` propagation across 5 call sites** in `autoIngestImpl` (see plan §8 table): 729 (checkIngestCache), 738 (remove `extractAndSaveMarkdownImages`), 767 (appendSavedImageRefsForCaption), 836 (remove `extractAndSaveMarkdownImages`), 1227 (saveIngestCache). [user:decision-2026-07-23-v3]
 - Toggle `false` path is byte-identical to today's behavior — including that the legacy `extractAndSaveMarkdownImages` still runs. Test this in Commit 5 regression pass. [plan:markdown-image-localizer.md]
+- **Localizer failure fallback**: `localizerRan` flag (not `shouldLocalize`) gates the legacy extractor skip. When the localizer throws, `localizerRan` stays `false` and both ingest branches fall back to `extractAndSaveMarkdownImages`, so images are never silently dropped. [test:code-review-round-4]
 - Codex-CLI: downloads + copies + rewrites still run; caption step skipped; empty alt stays empty; `stats.captioned=0`. [user:decision-2026-07-23-review]
 - Generator-side escape strategy: sanitize `"` → curly quote, `]` → `\]`, newlines → space. Never emit backslash-escaped quotes in generated output. Parser-side accepts both `"..."` and `'...'` title delimiters but does NOT unfold backslash-escapes (round-trip preservation only). [user:decision-2026-07-23-v3]
 
