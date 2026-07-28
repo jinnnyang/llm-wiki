@@ -651,8 +651,18 @@ async function appendIngestWarningLog(
  *
  * Currently folded in: `localizeMarkdownImages` (the markdown image
  * localizer's master toggle). `minImagePixelSize` and `urlCacheTtlDays`
- * are deliberately NOT folded in — they change per-image internal
- * behavior, not output shape, and shouldn't force full re-ingest.
+ * are deliberately NOT folded in.
+ *
+ * Trade-off for the two omitted flags (read before folding either in):
+ *   - `minImagePixelSize`: lowering it DOES change output — images that
+ *     were previously below threshold (empty alt) now get VLM captions.
+ *     We accept stale cache here on purpose: re-ingesting an entire
+ *     document just to caption a few small images is far more expensive
+ *     than the per-image caption cache, which already keys on SHA-256
+ *     and will fill in captions the next time each image is seen. Users
+ *     who want an immediate full refresh can delete the source page.
+ *   - `urlCacheTtlDays`: only governs re-fetch bandwidth, never the
+ *     emitted markdown or alt text, so it can never change output shape.
  *
  * To add a future fingerprint dimension, extend the format string here
  * — no changes to `ingest-cache.ts` needed.
@@ -782,6 +792,11 @@ async function autoIngestImpl(
   let workingSourceContent = sourceContent
   let workingWikiSourceContent = sourceContent
   let markdownLocalizedImages: SavedImage[] = []
+  // True only when Step 0.4 completed without throwing. The image
+  // gates below use this (not `shouldLocalize`) so a localizer failure
+  // falls back to the legacy extractAndSaveMarkdownImages path instead
+  // of silently dropping all markdown images.
+  let localizerRan = false
 
   if (isMarkdown && shouldLocalize) {
     try {
@@ -790,8 +805,13 @@ async function autoIngestImpl(
         sourcePath: sp,
         sourceSummarySlug,
         markdown: sourceContent,
-        llmConfig,
+        // Pass the RESOLVED caption config (dedicated vision endpoint or
+        // main LLM), not the raw main llmConfig. resolveCaptionConfig
+        // returns null only when mmCfg.enabled is false — impossible
+        // here because shouldLocalize already requires it.
+        llmConfig: captionLlm ?? llmConfig,
         multimodalConfig: mmCfg,
+        outputLanguage: useWikiStore.getState().outputLanguage,
         signal,
         onProgress: (done, total, stage) =>
           activity.updateItem(activityId, {
@@ -823,6 +843,7 @@ async function autoIngestImpl(
       }
 
       markdownLocalizedImages = result.savedImages
+      localizerRan = true
       console.log(
         `[ingest:localizer] "${fileName}": ` +
           `${result.stats.downloaded}dl ${result.stats.captioned}cap ` +
@@ -835,8 +856,9 @@ async function autoIngestImpl(
         `[ingest:localizer] failed for "${fileName}":`,
         err instanceof Error ? err.message : err,
       )
-      // Non-fatal: working* variables stay === sourceContent, legacy
-      // extractAndSaveMarkdownImages path takes over.
+      // Non-fatal: working* variables stay === sourceContent and
+      // localizerRan stays false, so the legacy
+      // extractAndSaveMarkdownImages path takes over below.
     }
   }
 
@@ -859,9 +881,11 @@ async function autoIngestImpl(
       let savedImages = skipNativePdfImageExtraction
         ? mineruSavedImages
         : await extractAndSaveSourceImages(pp, sp, sourceSummarySlug)
-      // When the localizer ran (Step 0.4), markdown images are already
-      // localized — skip the legacy extractor to avoid double-copy.
-      if (!shouldLocalize) {
+      // When the localizer ran successfully (Step 0.4), markdown images
+      // are already localized — skip the legacy extractor to avoid
+      // double-copy. On localizer failure localizerRan is false and we
+      // fall back to the legacy path so images aren't dropped.
+      if (!localizerRan) {
         const markdownImages = await extractAndSaveMarkdownImages(pp, sp, workingSourceContent, sourceSummarySlug)
         savedImages = [...savedImages, ...markdownImages]
       } else {
@@ -961,9 +985,10 @@ async function autoIngestImpl(
   let savedImages = skipNativePdfImageExtraction
     ? mineruSavedImages
     : await extractAndSaveSourceImages(pp, sp, sourceSummarySlug)
-  // When the localizer ran (Step 0.4), markdown images are already
-  // localized — skip the legacy extractor to avoid double-copy.
-  if (!shouldLocalize) {
+  // When the localizer ran successfully (Step 0.4), markdown images are
+  // already localized — skip the legacy extractor to avoid double-copy.
+  // On localizer failure localizerRan is false → legacy fallback.
+  if (!localizerRan) {
     const markdownImages = await extractAndSaveMarkdownImages(pp, sp, workingSourceContent, sourceSummarySlug)
     savedImages = [...savedImages, ...markdownImages]
   } else {
