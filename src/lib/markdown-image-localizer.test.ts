@@ -78,6 +78,14 @@ beforeEach(() => {
   mockCreateDirectory.mockResolvedValue(undefined as unknown as void)
   mockWriteFileBase64.mockResolvedValue(undefined as unknown as void)
   mockCopyFile.mockResolvedValue(undefined as unknown as void)
+  // Default readFileAsBase64: return a minimal valid 1×1 PNG so that
+  // Phase 3 metadata embedding (which reads the file back to patch
+  // bytes) actually runs in VLM tests instead of silently failing with
+  // "Cannot destructure property 'base64' of undefined".
+  mockReadFileAsBase64.mockResolvedValue({
+    base64: RED_1x1_PNG_B64,
+    mimeType: "image/png",
+  })
   // Default: reject VLM calls with a distinct sentinel so tests that
   // accidentally invoke it fail loudly. Individual VLM tests override.
   mockCaptionImage.mockRejectedValue(new Error("captionImage not mocked"))
@@ -1530,6 +1538,13 @@ describe("localizeMarkdownImages — Commit 4b VLM decision matrix (§1)", () =>
     expect(result.stats.skippedNoVlmProvider).toBe(0)
     // finalAlt threaded into rewritten body.
     expect(result.rewrittenSourceMarkdown).toContain("![A tidy line chart](")
+    // Phase 3 metadata embedding ran on the captioned image: the file is
+    // read back (readFileAsBase64) and rewritten with XMP/PNG-text bytes.
+    // writeFileBase64 is called twice — initial save + embed write-back.
+    expect(result.stats.metadataEmbedded).toBe(1)
+    expect(result.stats.metadataSkipped).toBe(0)
+    expect(mockReadFileAsBase64).toHaveBeenCalledTimes(1)
+    expect(mockWriteFileBase64).toHaveBeenCalledTimes(2)
   })
 
   it("test 4 — remote + NON-empty alt → skippedAuthorAlt, no VLM call", async () => {

@@ -66,6 +66,12 @@ export interface LocalizeOptions {
   signal?: AbortSignal
   onProgress?: (done: number, total: number, stage: "download" | "caption") => void
   /**
+   * Wiki output language (e.g. "Chinese", "English"). Forwarded to
+   * `captionImage` so VLM alt text matches the wiki's language.
+   * "auto" or undefined → model matches image content language.
+   */
+  outputLanguage?: string
+  /**
    * Optional override for image dimension probing. Injected primarily
    * for tests — vitest runs under jsdom where `createImageBitmap` is
    * undefined, so unit tests supply a stub. Production callers omit
@@ -695,8 +701,20 @@ export async function fetchRemoteImage(
     signal = ctrl.signal
   }
 
-  // 3: redirect-safe fetch.
-  const response = await fetchImportUrl(fetchImpl, url, signal)
+  // 3: redirect-safe fetch with standard browser headers.
+  // Many CDNs (WeChat, Zhihu, etc.) reject requests that lack a
+  // browser-like User-Agent. We send generic headers for ALL image
+  // fetches — no per-domain special-casing. If a platform still
+  // blocks (cookie-gated, signed URLs), that's beyond generic
+  // header fixes; the error propagates and the image is skipped.
+  const browserHeaders: Record<string, string> = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    Accept:
+      "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+  }
+  const response = await fetchImportUrl(fetchImpl, url, signal, browserHeaders)
 
   if (!response.ok) {
     throw new Error(
@@ -1315,12 +1333,12 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 
 /**
  * Split a VLM caption into `{ alt, title }`. Contract with the caption
- * prompt (see `vision-caption.ts:CAPTION_PROMPT`): the caption is one
- * line ≤ 100 chars. If the model returns multiple lines, first line
- * becomes `alt` and the rest joined with " " becomes `title`. Single
- * line: alt = caption, title = undefined (the author had no title
- * either; empty-alt-empty-title stays that way for tiny images, but
- * for captionable images we still emit alt).
+ * prompt (see `vision-caption.ts:CAPTION_PROMPT`): the caption is a
+ * single flowing paragraph of plain text with no line breaks, so the
+ * common case is `lines.length === 1` → alt = full caption, title =
+ * undefined. The multi-line branch is a defensive fallback for models
+ * that ignore the no-line-breaks instruction: first line becomes `alt`
+ * and the rest joined with " " becomes `title`.
  *
  * The alt/title returned here go through `formatImageAlt` /
  * `formatImageTitle` in `rewriteBySlot` — this function does NOT do
@@ -1440,6 +1458,7 @@ export async function localizeMarkdownImages(
     multimodalConfig,
     signal,
     onProgress,
+    outputLanguage,
     probeImageDimensions,
   } = opts
 
@@ -1728,6 +1747,7 @@ export async function localizeMarkdownImages(
         li.mimeType,
         llmConfig,
         signal,
+        { outputLanguage },
       )
       stats.captioned += 1
       captionDone += 1

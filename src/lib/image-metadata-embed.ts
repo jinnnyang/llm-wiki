@@ -208,8 +208,13 @@ function buildIptcIim(alt: string, title: string): Uint8Array {
   // Photoshop IRB wrapper: "8BIM" [id:2=0x0404] [name:2] [len:4] [IIM data] [pad]
   // Pascal string name: 1-byte count (0) + pad byte → 2 bytes total.
   const nameLen = 2
+  // Fixed header = 4 ("8BIM") + 2 (id) + 2 (name) + 4 (len) = 12 bytes,
+  // always even — so wrapperLen's parity is exactly iimTotal's parity.
   const wrapperLen = 4 + 2 + nameLen + 4 + iimTotal
-  const padded = wrapperLen + (wrapperLen % 2) // pad to even (covers odd IIM data)
+  // IRB spec: each resource block must end on an even byte offset. Since
+  // the 12-byte header is even, a single pad byte is needed iff the IIM
+  // payload is odd-length.
+  const padded = wrapperLen + (wrapperLen % 2)
 
   const out = new Uint8Array(padded)
   let off = 0
