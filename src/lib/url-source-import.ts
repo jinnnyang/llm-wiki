@@ -87,6 +87,7 @@ export async function fetchImportUrl(
   fetch: typeof globalThis.fetch,
   initialUrl: string,
   signal: AbortSignal,
+  headers?: Record<string, string>,
 ): Promise<Response> {
   let current = validateHttpUrl(initialUrl)
   const initialIsPrivate = isPrivateNetworkHost(current.hostname)
@@ -99,6 +100,7 @@ export async function fetchImportUrl(
       redirect: "manual",
       maxRedirections: 0,
       signal,
+      ...(headers ? { headers } : {}),
     }
     const response = await fetch(current.toString(), requestInit)
     if (![301, 302, 303, 307, 308].includes(response.status)) return response
